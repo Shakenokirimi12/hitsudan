@@ -120,6 +120,8 @@ let tools: [[String: Any]] = [
         "description": """
         ボードを前面に出し、ユーザーが手書きして「送る」を押すまで待ってから、その内容を画像で返す。\
         図や指示を手で描いてほしいときに使う。prompt を渡すとボード上部に見出しとして表示される。\
+        「赤で印を」と頼むなら color: red も一緒に渡す。その色の筆記具を依頼の間だけ借りられる。\
+        借りた筆記具は依頼が終わると元に戻る（間にユーザーが自分で選び直していればそちらが優先）。\
         MCP は外部からセッションを起こせないので、ユーザーの手書きを待つ唯一の方法がこれ。\
         時間切れになると「まだ」とだけ返るので、待ち続けるならそのまま呼び直すこと\
         （prompt は再表示され、押された瞬間を取り逃さない）。
@@ -129,6 +131,9 @@ let tools: [[String: Any]] = [
             "properties": [
                 "prompt": ["type": "string", "description": "ボードに表示する依頼文（例: この構成図の直したい所に赤で印を）"],
                 "timeout_seconds": ["type": "number", "description": "1回あたりの最大待ち時間。既定 55、上限 600。クライアント側のツールタイムアウトより短くすること"],
+                "color": ["type": "string", "description": "依頼の間だけ借りる筆記具: black / red / blue / green / laser"],
+                "width": ["type": "number", "description": "同じく線の太さ 2〜140"],
+                "eraser": ["type": "boolean", "description": "同じく消しゴムにするか"],
             ],
             "additionalProperties": false,
         ],
@@ -139,6 +144,7 @@ let tools: [[String: Any]] = [
         AI が生成したものをボードに送り、ユーザーが上からペンで指示を描き込めるようにする。\
         svg / image_path / text のいずれかを渡す。SVG は macOS がそのまま描画するので、\
         図・表・レイアウト案を渡すのに向く。\
+        color を渡せば、書き込んでほしい色の筆記具を判断が済むまで借りられる。\
         送った内容は半透明のプレビューとして表示され、ユーザーが「適用」を押すまで確定しない\
         （勝手に上書きしない）。適用されたかは board_status で確認できる。
         """,
@@ -151,27 +157,9 @@ let tools: [[String: Any]] = [
                 "notice": ["type": "string", "description": "ボード上部に出す一行"],
                 "clear_ink": ["type": "boolean", "description": "適用時に既存の手書きを消す。既定 false"],
                 "wait_seconds": ["type": "number", "description": "ユーザーの判断を待つ秒数。既定 0（待たずに返る）。上限 300"],
-            ],
-            "additionalProperties": false,
-        ],
-    ],
-    [
-        "name": "set_pen",
-        "description": """
-        依頼に合わせてボードの筆記具を借りる。\
-        **show_on_board で何かを送った直後か、wait_for_board で待っている間しか使えない。**\
-        普段ユーザーが書いているときの筆記具を勝手に変えることはできない。\
-        借りた筆記具は、ユーザーが送信するか提案を処理した時点で元に戻る\
-        （その間にユーザー自身が色を選び直していれば、そちらが優先される）。\
-        color: black / red / blue / green / laser（laser はインクを残さない指し棒）。\
-        width は 2〜140。eraser を true にすると消しゴムになる。
-        """,
-        "inputSchema": [
-            "type": "object",
-            "properties": [
-                "color": ["type": "string", "description": "black / red / blue / green / laser"],
-                "width": ["type": "number", "description": "線の太さ 2〜140"],
-                "eraser": ["type": "boolean", "description": "消しゴムにするか"],
+                "color": ["type": "string", "description": "書き込んでほしい色を借りる: black / red / blue / green / laser"],
+                "width": ["type": "number", "description": "同じく線の太さ 2〜140"],
+                "eraser": ["type": "boolean", "description": "同じく消しゴムにするか"],
             ],
             "additionalProperties": false,
         ],
@@ -188,20 +176,19 @@ let tools: [[String: Any]] = [
     ],
 ]
 
+/// The pen is borrowed as part of a request, never on its own — nobody wants
+/// their colour changed while they are simply writing.
+func lendPen(_ args: [String: Any]) {
+    var pen: [String: Any] = [:]
+    if let c = args["color"] as? String, !c.isEmpty { pen["color"] = c }
+    if let w = args["width"] as? Double, w > 0 { pen["width"] = w }
+    if let e = args["eraser"] as? Bool { pen["eraser"] = e }
+    guard !pen.isEmpty else { return }
+    command("set_pen", pen, timeout: 3)
+}
+
 func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
     switch name {
-    case "set_pen":
-        var payload: [String: Any] = [:]
-        if let c = args["color"] as? String { payload["color"] = c }
-        if let w = args["width"] as? Double { payload["width"] = w }
-        if let e = args["eraser"] as? Bool { payload["eraser"] = e }
-        guard !payload.isEmpty else { return failure("color / width / eraser のいずれかを指定してください") }
-        guard let reply = command("set_pen", payload) else { return failure(notRunning) }
-        if reply["ok"] as? Bool != true {
-            return failure((reply["error"] as? String) ?? "変更できませんでした")
-        }
-        return ["content": [text("筆記具を変更しました（太さ \(Int((reply["width"] as? Double) ?? 0))）")]]
-
     case "read_board":
         let who = (FileManager.default.currentDirectoryPath as NSString).lastPathComponent
         guard let reply = command("capture", ["label": who]) else { return failure(notRunning) }
@@ -220,6 +207,7 @@ func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
         guard command("wait", ["label": label, "cwd": cwd, "prompt": prompt ?? ""]) != nil else {
             return failure(notRunning)
         }
+        lendPen(args)
 
         let before = boardSeq
         let deadline = Date().addingTimeInterval(limit)
@@ -252,6 +240,7 @@ func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
         if reply["ok"] as? Bool != true {
             return failure((reply["error"] as? String) ?? "ボードに送れませんでした")
         }
+        lendPen(args)
         let id = (reply["proposalID"] as? String) ?? ""
         let wait = min(max((args["wait_seconds"] as? Double) ?? 0, 0), 300)
         guard wait > 0 else {
