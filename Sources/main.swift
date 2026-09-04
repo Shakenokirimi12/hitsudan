@@ -157,6 +157,12 @@ private func buildMenu() {
     fileItem.submenu = fileMenu
     main.addItem(fileItem)
 
+    let viewItem = NSMenuItem()
+    let viewMenu = NSMenu(title: "表示")
+    viewMenu.addItem(item("操作パネルの表示を切替", #selector(MainWindowController.toggleCleanMode(_:)), "p", [.command, .shift]))
+    viewItem.submenu = viewMenu
+    main.addItem(viewItem)
+
     let editItem = NSMenuItem()
     let editMenu = NSMenu(title: "編集")
     editMenu.addItem(item("元に戻す", #selector(MainWindowController.undoStroke(_:)), "z"))

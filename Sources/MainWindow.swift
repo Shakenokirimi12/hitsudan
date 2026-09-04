@@ -1,12 +1,25 @@
 import AppKit
 
+extension NSColor {
+    /// Open Color values are published as hex, so read them as written.
+    static func hex(_ value: UInt32, alpha: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: CGFloat((value >> 16) & 0xFF) / 255,
+                green: CGFloat((value >> 8) & 0xFF) / 255,
+                blue: CGFloat(value & 0xFF) / 255,
+                alpha: alpha)
+    }
+}
+
 final class SwatchView: NSView {
     let color: NSColor
+    /// The fifth slot is not ink at all: it points instead of marking.
+    let isLaser: Bool
     var isSelected = false { didSet { needsDisplay = true } }
     var onPick: ((SwatchView) -> Void)?
 
-    init(color: NSColor) {
+    init(color: NSColor, isLaser: Bool = false) {
         self.color = color
+        self.isLaser = isLaser
         super.init(frame: NSRect(x: 0, y: 0, width: 40, height: 40))
         translatesAutoresizingMaskIntoConstraints = false
         widthAnchor.constraint(equalToConstant: 40).isActive = true
@@ -16,12 +29,22 @@ final class SwatchView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let dot = bounds.insetBy(dx: 6, dy: 6)
-        color.setFill()
-        NSBezierPath(ovalIn: dot).fill()
-        NSColor.separatorColor.setStroke()
-        let edge = NSBezierPath(ovalIn: dot)
-        edge.lineWidth = 1
-        edge.stroke()
+        if isLaser {
+            // Drawn as what it does: a hot point inside a halo.
+            for (inset, alpha) in [(2.0, 0.16), (5.0, 0.28)] {
+                color.withAlphaComponent(CGFloat(alpha)).setFill()
+                NSBezierPath(ovalIn: bounds.insetBy(dx: CGFloat(inset), dy: CGFloat(inset))).fill()
+            }
+            color.setFill()
+            NSBezierPath(ovalIn: bounds.insetBy(dx: 13, dy: 13)).fill()
+        } else {
+            color.setFill()
+            NSBezierPath(ovalIn: dot).fill()
+            NSColor.separatorColor.setStroke()
+            let edge = NSBezierPath(ovalIn: dot)
+            edge.lineWidth = 1
+            edge.stroke()
+        }
         if isSelected {
             NSColor.controlAccentColor.setStroke()
             let ring = NSBezierPath(ovalIn: bounds.insetBy(dx: 2, dy: 2))
@@ -35,7 +58,7 @@ final class SwatchView: NSView {
 /// The stock bezels cap out around 32 pt tall, which is small for a target you
 /// hit with a pen on a 13-inch tablet. This draws its own.
 final class BigButton: NSButton {
-    var fill: NSColor = NSColor(srgbRed: 0.04, green: 0.44, blue: 0.37, alpha: 1)
+    var fill: NSColor = .hex(0x0CA678)   // Open Color teal 6
     var isSecondary = false
     var icon: NSImage? { didSet { needsDisplay = true } }
     /// Radians. The loader spins by advancing this.
@@ -161,6 +184,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var saveWork: DispatchWorkItem?
     private var eraserHeldFrom: Bool?
     private var lastInputNote = "なし"
+    private var panelView: NSView?
+    private var bottomBar: NSView?
+    private var cleanMode = false
 
     private let widgetStack = NSStackView()
     private var widgets: [WidgetView] = []
@@ -212,7 +238,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func installEscapeHatch() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53 else { return event }   // esc
-            self?.hideBoard(nil)
+            // Escape backs out one step at a time: panels first, board second.
+            if self?.cleanMode == true {
+                self?.toggleCleanMode(nil)
+            } else {
+                self?.hideBoard(nil)
+            }
             return nil
         }
     }
@@ -235,6 +266,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Leaving full screen is animated, so the window can only be ordered out
     /// once that has finished — hence the flag.
+    /// Sharing a screen in a call means the sheet is the only thing worth
+    /// showing — the panels are for working, not for an audience.
+    @objc func toggleCleanMode(_ sender: Any?) {
+        setCleanMode(!cleanMode)
+        UserDefaults.standard.set(cleanMode, forKey: "cleanMode")
+    }
+
+    private func setCleanMode(_ on: Bool) {
+        cleanMode = on
+        panelView?.isHidden = on
+        bottomBar?.isHidden = on
+        statusLabel.stringValue = on ? "" : "操作パネルを表示しました"
+    }
+
     @objc func hideBoard(_ sender: Any?) {
         if isFullScreen {
             hideAfterExitingFullScreen = true
@@ -311,6 +356,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         canvas.heightAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
 
         let panel = buildPanel()
+        panelView = panel
+        bottomBar = bottomRow
 
         let split = NSStackView(views: [left, panel])
         split.orientation = .horizontal
@@ -354,23 +401,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         mode.heightAnchor.constraint(equalToConstant: 48).isActive = true
         modeControl = mode
 
-        let colors: [NSColor] = [
-            NSColor(srgbRed: 0.09, green: 0.10, blue: 0.11, alpha: 1),   // 墨
-            NSColor(srgbRed: 0.82, green: 0.20, blue: 0.16, alpha: 1),   // 朱
-            NSColor(srgbRed: 0.11, green: 0.43, blue: 0.87, alpha: 1),   // 青
-            NSColor(srgbRed: 0.04, green: 0.42, blue: 0.36, alpha: 1),   // 緑
-            NSColor(srgbRed: 1.00, green: 0.80, blue: 0.00, alpha: 0.42) // 蛍光
+        // Open Color (MIT) — an OSS palette built for UI, so the inks stay
+        // legible on both light and dark grounds without hand-mixing.
+        let inks: [NSColor] = [
+            .hex(0x1E1E1E),   // 墨   gray 9 相当
+            .hex(0xE03131),   // 朱   red 8
+            .hex(0x1971C2),   // 青   blue 8
+            .hex(0x2F9E44),   // 緑   green 8
         ]
         let swatchStack = NSStackView()
         swatchStack.orientation = .horizontal
         swatchStack.spacing = 4
-        for (i, c) in colors.enumerated() {
+        for (i, c) in inks.enumerated() {
             let s = SwatchView(color: c)
             s.isSelected = (i == 0)
             s.onPick = { [weak self] picked in self?.pickColor(picked) }
             swatches.append(s)
             swatchStack.addArrangedSubview(s)
         }
+        let laser = SwatchView(color: .hex(0xF03E3E), isLaser: true)   // red 7
+        laser.toolTip = "レーザーポインタ — インクを残さず光点で指します"
+        laser.onPick = { [weak self] picked in self?.pickColor(picked) }
+        swatches.append(laser)
+        swatchStack.addArrangedSubview(laser)
 
         widthDial.doubleValue = 7
         widthDial.onChange = { [weak self] in self?.applyWidth() }
@@ -500,11 +553,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case .ready:
             sendButton.title = "送る"
             sendButton.icon = Lucide.image(Lucide.send, size: 24, color: .white)
-            sendButton.fill = NSColor(srgbRed: 0.04, green: 0.44, blue: 0.37, alpha: 1)
+            sendButton.fill = .hex(0x0CA678)
         case .sending:
             sendButton.title = "送信中"
             sendButton.icon = Lucide.image(Lucide.loaderCircle, size: 24, color: .white, strokeWidth: 2.4)
-            sendButton.fill = NSColor(srgbRed: 0.04, green: 0.44, blue: 0.37, alpha: 1)
+            sendButton.fill = .hex(0x0CA678)
             let spin = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
                 self?.sendButton.iconAngle -= .pi / 15
             }
@@ -513,7 +566,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case .sent:
             sendButton.title = "送信済み"
             sendButton.icon = Lucide.image(Lucide.check, size: 26, color: .white, strokeWidth: 2.6)
-            sendButton.fill = NSColor(srgbRed: 0.16, green: 0.52, blue: 0.32, alpha: 1)
+            sendButton.fill = .hex(0x2F9E44)   // Open Color green 8
         }
         sendButton.needsDisplay = true
     }
@@ -696,6 +749,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func run(_ action: BoardAction, down: Bool = true) {
         // Held actions are the only ones that care about the release.
+        if action == .laserWhileHeld { setLaser(down); return }
+
         if action == .eraseWhileHeld {
             if down {
                 // A second press while already held must not overwrite the state
@@ -715,6 +770,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // state — so record the flip for the release to honour instead.
         if action == .toggleEraser, let held = eraserHeldFrom {
             eraserHeldFrom = !held
+            return
+        }
+
+        if action == .laserWhileHeld {
+            setLaser(down)
             return
         }
 
@@ -744,7 +804,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             applyWidth()
         case .rightClick: inputs.click(.right)
         case .middleClick: inputs.click(.center)
-        case .passthrough, .none, .eraseWhileHeld: break
+        case .toggleLaser: setLaser(!canvas.laserMode)
+        case .passthrough, .none, .eraseWhileHeld, .laserWhileHeld: break
         case .color1, .color2, .color3, .color4, .color5: break   // handled above
         }
     }
@@ -966,6 +1027,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if w > 0 { widthDial.doubleValue = w; canvas.baseWidth = CGFloat(w) }
         }
         // Cursor takeover is the point of the app, so it is on unless turned off.
+        setCleanMode(d.bool(forKey: "cleanMode"))
         let wantsPointer = d.object(forKey: Key.pointer) == nil ? true : d.bool(forKey: Key.pointer)
         if wantsPointer, penScreen != nil {
             pointerBox.state = .on
@@ -1014,6 +1076,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.pointer.screen = self.penScreen
             self.pointer.handle(s)
 
+            if self.canvas.laserMode {
+                self.canvas.updateLaser(paper: s.inRange ? self.canvasPaperPoint(for: s) : nil)
+            }
+
             let now = (s.button1, s.button2, s.button3)
             if now.0 != self.previousPenButtons.0 { self.penButton(1, "pen.button1", down: now.0) }
             if now.1 != self.previousPenButtons.1 { self.penButton(2, "pen.button2", down: now.1) }
@@ -1025,8 +1091,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                            s.button2 ? "2" : "・", s.button3 ? "3" : "・"].joined()
             let target = self.pointer.isEnabled ? "カーソル操作" : (self.penScreen == nil ? "カーソル追従" : "絶対座標")
             self.telemetry.stringValue = String(
-                format: "%@ · %@  筆圧 %5d/16383 (%3.0f%%)  傾き %+3.0f°,%+3.0f°  ボタン %@",
-                s.mode.rawValue, target, s.rawPressure, s.pressure * 100, s.tiltX, s.tiltY, buttons)
+                format: "%@ · %@  筆圧 %5d/16383 (%3.0f%%)  ボタン %@",
+                s.mode.rawValue, target, s.rawPressure, s.pressure * 100, buttons)
         }
         pointer.mapsRightButton = false   // routed through the assignments instead
 
@@ -1265,14 +1331,34 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func modeChanged(_ sender: NSSegmentedControl) {
         canvas.eraserSelected = sender.selectedSegment == 1
+        if canvas.laserMode { setLaser(false) }
+    }
+
+    private func setLaser(_ on: Bool) {
+        canvas.laserMode = on
+        if on {
+            canvas.eraserSelected = false
+            modeControl?.selectedSegment = 0
+        }
+        for s in swatches where s.isLaser { s.isSelected = on }
+        if !on, let ink = swatches.first(where: { !$0.isLaser && $0.color == canvas.inkColor }) {
+            for s in swatches { s.isSelected = (s === ink) }
+        }
     }
 
     private func pickColor(_ picked: SwatchView) {
         for s in swatches { s.isSelected = (s === picked) }
-        canvas.inkColor = picked.color
         canvas.eraserSelected = false
-        // Picking a colour means "draw", so the mode control has to agree.
         modeControl?.selectedSegment = 0
+
+        if picked.isLaser {
+            canvas.laserMode = true
+            lastInputNote = "レーザー"
+            statusLabel.stringValue = "レーザーポインタ"
+            return
+        }
+        canvas.laserMode = false
+        canvas.inkColor = picked.color
         let index = (swatches.firstIndex(of: picked) ?? 0) + 1
         lastInputNote = "色\(index)"
         statusLabel.stringValue = "色\(index) を選択"
@@ -1422,6 +1508,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         canvas.ignoresMouse = false
         saveSettings()
         statusLabel.stringValue = "ペンでカーソル操作中"
+    }
+
+    /// Where this sample lands on the sheet, in paper coordinates.
+    private func canvasPaperPoint(for s: PenSample) -> CGPoint? {
+        guard let screen = penScreen, let window = self.window else { return nil }
+        let frame = screen.frame
+        let screenPoint = CGPoint(x: frame.minX + s.x * frame.width,
+                                  y: frame.maxY - s.y * frame.height)
+        return canvas.paperPoint(from: canvas.convert(window.convertPoint(fromScreen: screenPoint), from: nil))
     }
 
     private func drivePen(with s: PenSample) {

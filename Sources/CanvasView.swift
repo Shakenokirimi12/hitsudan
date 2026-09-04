@@ -30,6 +30,17 @@ final class CanvasView: NSView {
     var snapsShapes = true
     var onSnap: ((String) -> Void)?
 
+    /// Laser mode: the pen leaves no ink, only a red spot with a short trail —
+    /// for pointing at something on screen rather than marking it.
+    var laserMode = false {
+        didSet {
+            if !laserMode { laserTrail.removeAll(); needsDisplay = true }
+            else { startLaserFade() }
+        }
+    }
+    private var laserTrail: [(point: CGPoint, at: Date)] = []
+    private var laserTimer: Timer?
+
     /// A line from the session, shown across the top of the sheet.
     var notice: String? { didSet { needsDisplay = true } }
     /// Something a session wants to put on the sheet, shown faintly until the
@@ -87,6 +98,8 @@ final class CanvasView: NSView {
 
     private var paperScale: CGFloat { paperRect.width / Self.paperSize.width }
 
+    func paperPoint(from viewPoint: CGPoint) -> CGPoint { toPaper(viewPoint) }
+
     private func toPaper(_ viewPoint: CGPoint) -> CGPoint {
         let r = paperRect, k = paperScale
         return CGPoint(x: (viewPoint.x - r.minX) / k, y: (viewPoint.y - r.minY) / k)
@@ -130,7 +143,35 @@ final class CanvasView: NSView {
         return shape(pressure)
     }
 
+    /// Feed the pen's position while pointing. `nil` when the pen leaves.
+    func updateLaser(paper point: CGPoint?) {
+        guard laserMode else { return }
+        if let point { laserTrail.append((point, Date())) }
+        trimLaserTrail()
+        needsDisplay = true
+    }
+
+    private func trimLaserTrail() {
+        let cutoff = Date().addingTimeInterval(-0.45)
+        laserTrail.removeAll { $0.at < cutoff }
+        if laserTrail.count > 120 { laserTrail.removeFirst(laserTrail.count - 120) }
+    }
+
+    private func startLaserFade() {
+        laserTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.laserMode else { self.laserTimer?.invalidate(); self.laserTimer = nil; return }
+            guard !self.laserTrail.isEmpty else { return }
+            self.trimLaserTrail()
+            self.needsDisplay = true
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        laserTimer = timer
+    }
+
     func beginStroke(at viewPoint: CGPoint, width w: CGFloat, eraser: Bool) {
+        guard !laserMode else { return }
         // A pen stroke is only rasterised on release, so a second press arriving
         // before the matching release would throw the whole stroke away.
         if live != nil { finishStroke() }
@@ -148,7 +189,7 @@ final class CanvasView: NSView {
     }
 
     func extendStroke(to viewPoint: CGPoint, width w: CGFloat) {
-        guard live != nil else { return }
+        guard !laserMode, live != nil else { return }
         let point = toPaper(viewPoint)
 
         // Once snapped, the gesture keeps steering the shape rather than adding
@@ -312,6 +353,40 @@ final class CanvasView: NSView {
         g.setLineWidth(1)
         g.stroke(r.insetBy(dx: 0.5, dy: 0.5))
 
+        if laserMode, !laserTrail.isEmpty {
+            g.saveGState()
+            g.clip(to: r)
+            let now = Date()
+            let red = NSColor(srgbRed: 0.94, green: 0.24, blue: 0.24, alpha: 1)   // Open Color red 7
+
+            // The tail, oldest first so the newest sits on top.
+            g.setLineCap(.round)
+            g.setLineJoin(.round)
+            for i in 1..<max(laserTrail.count, 1) {
+                let age = now.timeIntervalSince(laserTrail[i].at)
+                let life = max(0, 1 - age / 0.45)
+                guard life > 0 else { continue }
+                g.setStrokeColor(red.withAlphaComponent(CGFloat(life) * 0.5).cgColor)
+                g.setLineWidth(2 + 7 * CGFloat(life))
+                g.beginPath()
+                g.move(to: toView(laserTrail[i - 1].point))
+                g.addLine(to: toView(laserTrail[i].point))
+                g.strokePath()
+            }
+
+            if let head = laserTrail.last?.point {
+                let centre = toView(head)
+                for (radius, alpha) in [(26.0, 0.10), (17.0, 0.18), (10.0, 0.45)] {
+                    g.setFillColor(red.withAlphaComponent(CGFloat(alpha)).cgColor)
+                    g.fillEllipse(in: CGRect(x: centre.x - radius, y: centre.y - radius,
+                                             width: radius * 2, height: radius * 2))
+                }
+                g.setFillColor(NSColor(srgbRed: 1, green: 0.86, blue: 0.86, alpha: 1).cgColor)
+                g.fillEllipse(in: CGRect(x: centre.x - 4, y: centre.y - 4, width: 8, height: 8))
+            }
+            g.restoreGState()
+        }
+
         if let notice, !notice.isEmpty {
             let band = NSRect(x: r.minX, y: r.maxY - 62, width: r.width, height: 62)
             g.setFillColor(NSColor(srgbRed: 0.04, green: 0.44, blue: 0.37, alpha: 0.94).cgColor)
@@ -454,7 +529,9 @@ final class CanvasView: NSView {
         let cx = minX + rx, cy = minY + ry
 
         var onEllipse = 0, onBox = 0
-        let tolerance = max(min(rx, ry) * 0.18, 8)
+        // A hand-drawn box bows on the edges and rounds at the corners, so the
+        // band it has to stay inside is wider than it first seems.
+        let tolerance = max(min(rx, ry) * 0.24, 12)
         for p in points {
             let radial = abs(pow((p.x - cx) / rx, 2) + pow((p.y - cy) / ry, 2) - 1)
             if radial < 0.38 { onEllipse += 1 }
@@ -462,8 +539,9 @@ final class CanvasView: NSView {
             if edge < tolerance { onBox += 1 }
         }
         let total = CGFloat(points.count)
-        // A rectangle hugs its bounding box everywhere; an ellipse cuts corners.
-        if CGFloat(onBox) / total > 0.92 { return .rectangle }
+        // A rectangle hugs its bounding box nearly everywhere; an ellipse only
+        // touches it at four points, so a loose threshold still separates them.
+        if CGFloat(onBox) / total > 0.84 { return .rectangle }
         if CGFloat(onEllipse) / total > 0.75 { return .ellipse }
         return nil
     }

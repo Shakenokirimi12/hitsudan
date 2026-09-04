@@ -313,7 +313,7 @@ final class DialControl: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let fraction = t
-        let accent = NSColor(srgbRed: 0.04, green: 0.44, blue: 0.37, alpha: 1)
+        let accent = NSColor.hex(0x0CA678)   // Open Color teal 6
 
         let track = NSBezierPath()
         track.appendArc(withCenter: centre, radius: ringRadius,
@@ -410,7 +410,7 @@ final class PlusButton: NSButton {
         shadow.shadowBlurRadius = 10
         shadow.shadowOffset = NSSize(width: 0, height: -3)
         shadow.set()
-        let green = NSColor(srgbRed: 0.13, green: 0.62, blue: 0.38, alpha: 1)
+        let green = NSColor.hex(0x2F9E44)   // Open Color green 8
         (isHighlighted ? green.blended(withFraction: 0.2, of: .black) ?? green : green).setFill()
         path.fill()
         NSGraphicsContext.restoreGraphicsState()

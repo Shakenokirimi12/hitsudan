@@ -6,6 +6,7 @@ enum BoardAction: String, CaseIterable {
     case passthrough, none, undo, redo, clear, send, toggleEraser, eraseWhileHeld, nextColor
     case thicker, thinner, rightClick, middleClick, previousPage, nextPage, newPage
     case color1, color2, color3, color4, color5
+    case toggleLaser, laserWhileHeld
 
     /// Index into the swatch row, for the five colour actions.
     var colourIndex: Int? {
@@ -22,7 +23,7 @@ enum BoardAction: String, CaseIterable {
     static let colourActions: [BoardAction] = [.color1, .color2, .color3, .color4, .color5]
 
     /// Acts on release as well as press.
-    var isMomentary: Bool { self == .eraseWhileHeld }
+    var isMomentary: Bool { self == .eraseWhileHeld || self == .laserWhileHeld }
 
     var label: String {
         switch self {
@@ -46,7 +47,9 @@ enum BoardAction: String, CaseIterable {
         case .color2: return "色2 朱"
         case .color3: return "色3 青"
         case .color4: return "色4 緑"
-        case .color5: return "色5 蛍光"
+        case .color5: return "色5 レーザー"
+        case .toggleLaser: return "レーザー切替"
+        case .laserWhileHeld: return "押している間だけレーザー"
         }
     }
 }
