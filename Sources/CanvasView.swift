@@ -52,7 +52,8 @@ final class CanvasView: NSView {
     private var live: Stroke?
     private var burned = 0                    // points of `live` already in the bitmap
 
-    private enum ShapeKind { case line, ellipse, rectangle }
+    private enum ShapeKind { case line, ellipse, rectangle, triangle }
+    private let recogniser = DollarRecognizer()
     private var strokeStart: CGPoint?
     /// The corner (or end) the snapped shape is pinned to while it is adjusted.
     private var snapAnchor: CGPoint?
@@ -146,7 +147,15 @@ final class CanvasView: NSView {
     /// Feed the pen's position while pointing. `nil` when the pen leaves.
     func updateLaser(paper point: CGPoint?) {
         guard laserMode else { return }
-        if let point { laserTrail.append((point, Date())) }
+        if let point {
+            // Samples arrive around 200 Hz. Keeping every one packs the trail
+            // with coincident points, which stack up into a line of blobs.
+            if let last = laserTrail.last, hypot(point.x - last.point.x, point.y - last.point.y) < 4 {
+                laserTrail[laserTrail.count - 1].at = Date()
+            } else {
+                laserTrail.append((point, Date()))
+            }
+        }
         trimLaserTrail()
         needsDisplay = true
     }
@@ -359,18 +368,24 @@ final class CanvasView: NSView {
             let now = Date()
             let red = NSColor(srgbRed: 0.94, green: 0.24, blue: 0.24, alpha: 1)   // Open Color red 7
 
-            // The tail, oldest first so the newest sits on top.
+            // Two continuous passes — a soft outer streak and a brighter recent
+            // half — instead of one stroke per sample, which overlap into dots.
             g.setLineCap(.round)
             g.setLineJoin(.round)
-            for i in 1..<max(laserTrail.count, 1) {
-                let age = now.timeIntervalSince(laserTrail[i].at)
-                let life = max(0, 1 - age / 0.45)
-                guard life > 0 else { continue }
-                g.setStrokeColor(red.withAlphaComponent(CGFloat(life) * 0.5).cgColor)
-                g.setLineWidth(2 + 7 * CGFloat(life))
+            let freshness = max(0, 1 - now.timeIntervalSince(laserTrail.last?.at ?? now) / 0.45)
+            if laserTrail.count >= 2 {
+                let all = laserTrail.map { toView($0.point) }
+                g.setStrokeColor(red.withAlphaComponent(0.22 * CGFloat(freshness)).cgColor)
+                g.setLineWidth(9)
                 g.beginPath()
-                g.move(to: toView(laserTrail[i - 1].point))
-                g.addLine(to: toView(laserTrail[i].point))
+                g.addLines(between: all)
+                g.strokePath()
+
+                let recent = Array(all.suffix(max(all.count / 2, 2)))
+                g.setStrokeColor(red.withAlphaComponent(0.42 * CGFloat(freshness)).cgColor)
+                g.setLineWidth(4.5)
+                g.beginPath()
+                g.addLines(between: recent)
                 g.strokePath()
             }
 
@@ -470,19 +485,36 @@ final class CanvasView: NSView {
 
         let first = points.first!, last = points.last!
         let chord = hypot(last.x - first.x, last.y - first.y)
-        let closed = chord < length * 0.22
 
-        let kind: ShapeKind?
-        if closed {
-            kind = closedShape(points)
-        } else {
-            kind = isLine(points, from: first, to: last, chord: chord) ? .line : nil
+        // What was drawn is the recogniser's call; where and how big is ours.
+        // Measured on synthetic strokes (Tools/rectest.swift): real shapes score
+        // 0.93 and up, while blobs, scribbles and wavy lines top out at 0.84.
+        guard let verdict = recogniser.recognise(points), verdict.score > 0.88 else { return }
+        let kind: ShapeKind
+        switch verdict.kind {
+        case .line:
+            // A closed loop can still score as a line once normalised; refuse it.
+            guard chord > length * 0.45 else { return }
+            kind = .line
+        case .circle: kind = .ellipse
+        case .rectangle: kind = .rectangle
+        case .triangle: kind = .triangle
         }
-        guard let kind else { return }
 
         // A closed shape's first and last points sit on top of each other, so
         // the ideal version has to come from the bounding box, not from the two
         // ends — otherwise it collapses to nothing.
+        if kind == .triangle {
+            // Three corners fitted to the drawing, and then left alone: there is
+            // no single corner a drag could sensibly steer.
+            snapped = kind
+            snapAnchor = nil
+            live!.points = triangle(through: points, width: averageWidth())
+            needsDisplay = true
+            onSnap?("三角に補正")
+            return
+        }
+
         let anchor: CGPoint, moving: CGPoint
         if kind == .line {
             anchor = start
@@ -508,46 +540,40 @@ final class CanvasView: NSView {
         onSnap?(kind == .line ? "直線に補正" : kind == .ellipse ? "円に補正" : "四角に補正")
     }
 
-    private func isLine(_ points: [CGPoint], from a: CGPoint, to b: CGPoint, chord: CGFloat) -> Bool {
-        guard chord > 40 else { return false }
+    /// The widest triangle the stroke covers: the two furthest points make the
+    /// base, and the point furthest from that line is the apex.
+    private func triangle(through points: [CGPoint], width w: CGFloat) -> [Point] {
+        var a = points[0], b = points[0]
+        var best: CGFloat = 0
+        for i in 0..<points.count {
+            for j in (i + 1)..<points.count {
+                let d = hypot(points[j].x - points[i].x, points[j].y - points[i].y)
+                if d > best { best = d; a = points[i]; b = points[j] }
+            }
+        }
         let dx = b.x - a.x, dy = b.y - a.y
-        var worst: CGFloat = 0
+        let base = max(hypot(dx, dy), 0.0001)
+        var apex = points[0]
+        var furthest: CGFloat = 0
         for p in points {
-            // Distance from the chord, by the cross product over its length.
-            let d = abs(dy * (p.x - a.x) - dx * (p.y - a.y)) / chord
-            worst = max(worst, d)
+            let d = abs(dy * (p.x - a.x) - dx * (p.y - a.y)) / base
+            if d > furthest { furthest = d; apex = p }
         }
-        return worst < max(chord * 0.06, 6)
-    }
-
-    private func closedShape(_ points: [CGPoint]) -> ShapeKind? {
-        let xs = points.map(\.x), ys = points.map(\.y)
-        guard let minX = xs.min(), let maxX = xs.max(),
-              let minY = ys.min(), let maxY = ys.max() else { return nil }
-        let rx = (maxX - minX) / 2, ry = (maxY - minY) / 2
-        guard rx > 20, ry > 20 else { return nil }
-        let cx = minX + rx, cy = minY + ry
-
-        var onEllipse = 0, onBox = 0
-        // A hand-drawn box bows on the edges and rounds at the corners, so the
-        // band it has to stay inside is wider than it first seems.
-        let tolerance = max(min(rx, ry) * 0.24, 12)
-        for p in points {
-            let radial = abs(pow((p.x - cx) / rx, 2) + pow((p.y - cy) / ry, 2) - 1)
-            if radial < 0.38 { onEllipse += 1 }
-            let edge = min(min(abs(p.x - minX), abs(p.x - maxX)), min(abs(p.y - minY), abs(p.y - maxY)))
-            if edge < tolerance { onBox += 1 }
+        var out: [Point] = []
+        for (from, to) in [(a, apex), (apex, b), (b, a)] {
+            for step in 0...24 {
+                let t = CGFloat(step) / 24
+                out.append(Point(p: CGPoint(x: from.x + (to.x - from.x) * t,
+                                            y: from.y + (to.y - from.y) * t), w: w))
+            }
         }
-        let total = CGFloat(points.count)
-        // A rectangle hugs its bounding box nearly everywhere; an ellipse only
-        // touches it at four points, so a loose threshold still separates them.
-        if CGFloat(onBox) / total > 0.84 { return .rectangle }
-        if CGFloat(onEllipse) / total > 0.75 { return .ellipse }
-        return nil
+        return out
     }
 
     private func idealShape(_ kind: ShapeKind, from a: CGPoint, to b: CGPoint, width w: CGFloat) -> [Point] {
         switch kind {
+        case .triangle:
+            return live?.points ?? []
         case .line:
             return (0...48).map { i in
                 let t = CGFloat(i) / 48

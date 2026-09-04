@@ -7,7 +7,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 SOURCES=(Sources/TabletHID.swift Sources/PenPointer.swift Sources/CanvasView.swift
          Sources/BoardBridge.swift Sources/Widgets.swift Sources/InputMap.swift
-         Sources/PageStore.swift Sources/MainWindow.swift Sources/main.swift)
+         Sources/PageStore.swift Sources/DollarRecognizer.swift
+         Sources/MainWindow.swift Sources/main.swift)
 
 # Without an explicit -target the SDK's own version becomes the minimum, so the
 # binary silently demands the OS it was built on while Info.plist claims 13.0.
