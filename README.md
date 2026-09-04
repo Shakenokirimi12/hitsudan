@@ -63,20 +63,39 @@ claude mcp add --scope user hitsudan -- ~/Developer/hitsudan/hitsudan-mcp
 | `clear_board` | 消去を提案する |
 | `board_status` | 接続・ストローク数・下敷き・未処理の提案・seq |
 
-### ボードから Claude を起こせるか → 起こせない
+### ボードから Claude を起こす
 
-調べた結論。Claude Code 2.1.260 が MCP クライアントとして申告する capabilities は
+MCP では起こせない（下記）が、**ハーネスのフックからなら起こせる**。
+コマンドフックの `asyncRewake` は、バックグラウンドで走って**終了コード 2 でモデルを起こす**。
+
+`Tools/board-wake.sh` を `Stop` フックに仕掛けてある。セッションが応答を終えたあとも
+バックグラウンドで `board.json` の `seq` を監視し、ユーザーが「送る」を押した瞬間に
+exit 2 で叩き起こす。stderr の文面がそのままモデルに渡る。
 
 ```json
-{ "roots": { "listChanged": true }, "elicitation": {} }
+"hooks": { "Stop": [ { "hooks": [ {
+  "type": "command",
+  "command": "~/Developer/hitsudan/Tools/board-wake.sh",
+  "asyncRewake": true,
+  "timeout": 1830
+} ] } ] }
 ```
 
-**`sampling` が無い**。つまり MCP サーバから Claude に推論を依頼することはできない。
-`elicitation` はあるが、これはサーバが「人間」に入力を求めるもので、Claude を起こすものではない。
-CLI 側にも注入の口は無い（`claude agents --json` でセッション一覧は取れるが、送る手段が無い）。
+未回収の依頼（`~/.hitsudan/requests/<label>.json`）が無ければ即 exit 0 で何もしない。
+待ち役はセッションごとに 1 つだけ（`<label>.wait` に pid を置くロック）なので、
+停止のたびに監視プロセスが増えることはない。
 
-したがってユーザーの手書きを待つ唯一の方法が `wait_for_board`。
-セッション側が呼んで待つ、という向きにしかできない。
+これで `request_board` → 別作業 → ユーザーが書いて送信 → **セッションが自動で起きて
+`collect_board`** という、イベント駆動の往復が成立する。
+
+### MCP の sampling は使えない
+
+Claude Code 2.1.260 のクライアントに `sampling/createMessage` は実装されていない。
+申告 capabilities に無いだけでなく、実際に投げると `-32601 Method not found` が返る
+（`Tools/samplingprobe.swift` で再現できる）。あるのは `roots` と `elicitation` だけ。
+CLI にも実行中セッションへの注入口は無い。
+
+調べた結論。Claude Code 2.1.260 が MCP クライアントとして申告する capabilities は
 
 MCP クライアントの申告内容は `~/.hitsudan/mcp-client.json` に毎回記録しているので、
 将来 `sampling` が生えたらそこで気づける。
