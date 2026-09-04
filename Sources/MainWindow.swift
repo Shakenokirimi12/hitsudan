@@ -170,6 +170,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var lastProposalID = ""
     private var lastProposalOutcome = ""
     private var readingClearWork: DispatchWorkItem?
+    /// What the pen was before a session borrowed it, and what the session set
+    /// it to — so it can be handed back untouched, and only if the person has
+    /// not since chosen something else themselves.
+    private var penLoan: (restoreInk: Int, restoreWidth: Double, lentInk: Int, lentWidth: Double)?
 
     private enum SendState { case ready, sending, sent }
     private var sendState: SendState = .ready { didSet { applySendState() } }
@@ -570,7 +574,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         waitingLabel = nil
         waitingUntil = .distantPast
         canvas.notice = nil
+        returnBorrowedPen()
         applySendState()
+    }
+
+    private func currentInkIndex() -> Int {
+        swatches.firstIndex(where: { $0.isSelected }) ?? 0
+    }
+
+    /// Give the pen back, unless the person has picked something else since —
+    /// their own choice always outranks the loan.
+    private func returnBorrowedPen() {
+        guard let loan = penLoan else { return }
+        penLoan = nil
+        guard currentInkIndex() == loan.lentInk,
+              abs(widthDial.doubleValue - loan.lentWidth) < 0.01 else { return }
+        if swatches.indices.contains(loan.restoreInk) { pickColor(swatches[loan.restoreInk]) }
+        widthDial.doubleValue = loan.restoreWidth
+        applyWidth()
     }
 
     private func applySendState() {
@@ -579,16 +600,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sendButton.iconAngle = 0
         switch sendState {
         case .ready:
-            // Nobody asked: pressing this is still useful, but it is a copy to
-            // the clipboard, not an answer to anyone. Say so rather than
-            // offering a green button that goes nowhere.
-            let requested = waitingLabel != nil
-            sendButton.title = requested ? "送る → \(waitingLabel!)" : "クリップボードへ"
-            sendButton.isSecondary = !requested
-            sendButton.icon = Lucide.image(Lucide.send, size: 24,
-                                           color: requested ? .white : .labelColor)
+            // Sending only means something when a session is waiting for it, so
+            // the button is not there the rest of the time.
+            sendButton.isHidden = waitingLabel == nil
+            sendButton.title = waitingLabel.map { "送る → \($0)" } ?? "送る"
+            sendButton.isSecondary = false
+            sendButton.icon = Lucide.image(Lucide.send, size: 24, color: .white)
             sendButton.fill = .hex(0x0CA678)
         case .sending:
+            sendButton.isHidden = false
             sendButton.isSecondary = false
             sendButton.title = "送信中"
             sendButton.icon = Lucide.image(Lucide.loaderCircle, size: 24, color: .white, strokeWidth: 2.4)
@@ -599,8 +619,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             RunLoop.main.add(spin, forMode: .common)
             spinTimer = spin
         case .sent:
+            sendButton.isHidden = false
             sendButton.isSecondary = false
-            sendButton.title = waitingLabel == nil ? "コピーしました" : "送信済み"
+            sendButton.title = "送信済み"
             sendButton.icon = Lucide.image(Lucide.check, size: 26, color: .white, strokeWidth: 2.6)
             sendButton.fill = .hex(0x2F9E44)   // Open Color green 8
         }
@@ -1321,6 +1342,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return ["ok": true, "pending": true, "proposalID": id]
 
         case "set_pen":
+            // Only while something has actually been asked of the person. The
+            // pen belongs to whoever is drawing with it the rest of the time.
+            guard waitingLabel != nil || proposal != nil else {
+                return ["ok": false,
+                        "error": "依頼中のときだけ変更できます。show_on_board か wait_for_board と一緒に呼んでください"]
+            }
+            if penLoan == nil {
+                penLoan = (currentInkIndex(), widthDial.doubleValue, currentInkIndex(), widthDial.doubleValue)
+            }
             if let name = (args["color"] as? String)?.lowercased() {
                 let index: Int?
                 switch name {
@@ -1344,6 +1374,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 canvas.eraserSelected = eraser
                 modeControl?.selectedSegment = eraser ? 1 : 0
             }
+            penLoan?.lentInk = currentInkIndex()
+            penLoan?.lentWidth = widthDial.doubleValue
             return ["ok": true, "width": widthDial.doubleValue]
 
         case "status":
@@ -1383,6 +1415,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func endProposal() {
         proposal = nil
+        if waitingLabel == nil { returnBorrowedPen() }
         canvas.preview = nil
         for v in [proposalLabel, applyButton, discardButton] as [NSView] { v.isHidden = true }
     }
@@ -1506,6 +1539,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func send(_ sender: Any?) {
         guard sendState != .sending else { return }
+        guard waitingLabel != nil else {
+            statusLabel.stringValue = "待っているセッションがありません"
+            return
+        }
         guard !canvas.isEmpty else {
             statusLabel.stringValue = "キャンバスが空です"
             return

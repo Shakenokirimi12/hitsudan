@@ -158,10 +158,13 @@ let tools: [[String: Any]] = [
     [
         "name": "set_pen",
         "description": """
-        ボードの筆記具を変える。色を指定してから wait_for_board で書いてもらうと、\
-        「赤で印を」と頼んだとおりの色で描いてもらえる。\
+        依頼に合わせてボードの筆記具を借りる。\
+        **show_on_board で何かを送った直後か、wait_for_board で待っている間しか使えない。**\
+        普段ユーザーが書いているときの筆記具を勝手に変えることはできない。\
+        借りた筆記具は、ユーザーが送信するか提案を処理した時点で元に戻る\
+        （その間にユーザー自身が色を選び直していれば、そちらが優先される）。\
         color: black / red / blue / green / laser（laser はインクを残さない指し棒）。\
-        width は 2〜140。eraser を true にすると消しゴムになる。すぐ反映される。
+        width は 2〜140。eraser を true にすると消しゴムになる。
         """,
         "inputSchema": [
             "type": "object",
