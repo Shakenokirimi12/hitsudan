@@ -297,6 +297,10 @@ func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
         let deadline = Date().addingTimeInterval(limit)
         while Date() < deadline {
             if boardSeq > before {
+                // The record is what the Stop hook watches. Leaving it behind
+                // after a synchronous wait would make every later stop look
+                // like a fresh reply and wake the session for ever.
+                try? FileManager.default.removeItem(at: requestFile)
                 command("wait_end", [:])
                 let note = (readJSON(boardMeta)?["savedAt"] as? String) ?? ""
                 return boardContent(header: "ユーザーが送信した手書き（\(note)）")

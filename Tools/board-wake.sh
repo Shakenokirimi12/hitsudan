@@ -27,12 +27,19 @@ try: print(json.load(open(sys.argv[1])).get('seq', 0))
 except Exception: print(0)" "$1" 2>/dev/null || echo 0; }
 
 asked=$(seq_of "$req")
+woke_file="$root/requests/$label.woke"
+woke=$(cat "$woke_file" 2>/dev/null || echo -1)
 deadline=$(( $(date +%s) + ${HITSUDAN_WAKE_TIMEOUT:-1800} ))
 
 while (( $(date +%s) < deadline )); do
   # 回収済み・取り下げ済みなら黙って終わる。
-  [[ -f "$req" ]] || exit 0
-  if (( $(seq_of "$root/board.json") > asked )); then
+  if [[ ! -f "$req" ]]; then rm -f "$woke_file"; exit 0; fi
+  current=$(seq_of "$root/board.json")
+  if (( current > asked )); then
+    # 同じ返信で二度は起こさない。伝えたのに回収されないまま停止するたび
+    # 叩き起こしていては、ただの妨害になる。
+    if (( current == woke )); then exit 0; fi
+    echo "$current" > "$woke_file"
     print -u2 "筆談ボードに手書きが届きました。mcp__hitsudan__collect_board で回収して、内容に応じて続けてください。"
     exit 2
   fi
