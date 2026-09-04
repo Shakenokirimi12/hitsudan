@@ -283,6 +283,74 @@ tip ビットをそのまま使うのが最も軽い。
 
 サイドボタン1は右クリックに割り当ててある。
 
+## CI
+
+`.github/workflows/build.yml`。`main` への push とタグで動く。
+
+- 図形認識の判定テスト（`Tools/run-tests.sh`）
+- ユニバーサルビルド
+- 成果物の検証 — arm64/x86_64 の両方が入っているか、`minos` が 13.0 で
+  Info.plist の申告と一致するか（実体が 26.0 なのに plist が 13.0 と嘘を
+  ついていたことがある）、アイコンの有無、署名の検証
+- MCP サーバに実際に JSON-RPC を流して 7 ツールを申告するか確認
+- `Hitsudan.app.zip` をアーティファクトに
+
+**`v*` のタグを打つと**、署名 → 公証 → Release への添付まで自動で走る。
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+### 署名と公証に必要な Secrets
+
+未設定でも CI は通る（アドホック署名にフォールバックし、Release にもその旨が書かれる）。
+設定すると Developer ID 署名と公証が有効になる。
+
+| Secret | 中身 |
+|---|---|
+| `MACOS_SIGN_IDENTITY` | `Developer ID Application: 名前 (TEAMID)` — `security find-identity -v -p codesigning` に出る文字列そのまま |
+| `MACOS_CERTIFICATE_P12` | Developer ID Application 証明書と秘密鍵を書き出した `.p12` を base64 にしたもの |
+| `MACOS_CERTIFICATE_PASSWORD` | その `.p12` のパスワード |
+| `APPLE_API_KEY_ID` | App Store Connect API キーの Key ID |
+| `APPLE_API_ISSUER_ID` | 同じく Issuer ID |
+| `APPLE_API_KEY_P8` | `AuthKey_XXXXXXXX.p8` を base64 にしたもの |
+
+準備手順:
+
+```sh
+# 1. Xcode か developer.apple.com で「Developer ID Application」証明書を作る
+#    （Apple Development ではなく Developer ID。配布用はこちら）
+
+# 2. キーチェーンアクセスで証明書と秘密鍵を選び、.p12 に書き出す
+base64 -i DeveloperID.p12 | pbcopy      # → MACOS_CERTIFICATE_P12
+
+# 3. 識別名を確認する
+security find-identity -v -p codesigning  # → MACOS_SIGN_IDENTITY
+
+# 4. App Store Connect → ユーザーとアクセス → 統合 → App Store Connect API で
+#    「Developer」ロールのキーを作り、.p8 をダウンロード
+base64 -i AuthKey_XXXXXXXX.p8 | pbcopy   # → APPLE_API_KEY_P8
+
+# 5. gh で登録
+gh secret set MACOS_SIGN_IDENTITY
+gh secret set MACOS_CERTIFICATE_P12
+gh secret set MACOS_CERTIFICATE_PASSWORD
+gh secret set APPLE_API_KEY_ID
+gh secret set APPLE_API_ISSUER_ID
+gh secret set APPLE_API_KEY_P8
+```
+
+公証には**ハードンドランタイム**とタイムスタンプが要るので、`HITSUDAN_SIGN_IDENTITY`
+が指定されているときだけ `codesign` に `--options runtime --timestamp` を付ける。
+ローカルの自己署名ビルドには付けない。
+
+なお HID の読み取り（IOHIDManager）とイベント生成はハードンドランタイムでも
+entitlement を必要としない。必要なのは TCC の許可（入力監視・アクセシビリティ）だけ。
+
+**Developer ID で署名すると、いま与えてある入力監視とアクセシビリティの許可は
+一度取り直しになる**（署名要件が変わるため）。ただしそれ以降は自己署名鍵より確実に
+安定する。
+
 ## 図形補正
 
 描いたあとペンを離さずに 0.55 秒静止すると、直線・円・四角・三角に整形される。

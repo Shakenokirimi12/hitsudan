@@ -3,12 +3,19 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write        # タグを打ったときに Release を作るため
 
 jobs:
   build:
     runs-on: macos-latest
+    env:
+      SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -20,9 +27,33 @@ jobs:
       - name: 図形認識のテスト
         run: ./Tools/run-tests.sh
 
+      # 署名鍵はリポジトリには置けないので Secrets から一時キーチェーンへ。
+      # Secrets が無ければ丸ごと飛ばし、build.sh がアドホック署名に落ちる。
+      - name: Developer ID を読み込む
+        if: env.SIGN_IDENTITY != ''
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -e
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          password="$(openssl rand -base64 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          # これが無いと codesign が鍵を使うたびに GUI 確認を求めて詰まる
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$keychain"
+
       - name: ビルド
-        # 署名鍵はこの Mac のキーチェーンにしかないので、CI では
-        # build.sh がアドホック署名にフォールバックする（警告つき）。
+        env:
+          HITSUDAN_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: ./build.sh
 
       - name: 成果物を検証
@@ -44,6 +75,10 @@ jobs:
           echo "--- アイコンが入っているか ---"
           test -s Hitsudan.app/Contents/Resources/Hitsudan.icns
 
+          echo "--- 署名 ---"
+          codesign -dvv Hitsudan.app 2>&1 | grep -E "Authority|Identifier|Runtime" || true
+          codesign --verify --deep --strict --verbose=2 Hitsudan.app
+
       - name: MCP サーバの疎通確認
         run: |
           set -e
@@ -59,7 +94,49 @@ jobs:
       - name: アプリを固める
         run: ditto -c -k --keepParent Hitsudan.app Hitsudan.app.zip
 
+      # 公証まで通していないと、配った先の Mac では Gatekeeper に止められる。
+      # タグを打ったときだけ実行する（1回あたり数分かかるため）。
+      - name: 公証して staple する
+        if: startsWith(github.ref, 'refs/tags/v') && env.NOTARY_KEY_ID != ''
+        env:
+          KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -e
+          echo "$KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          xcrun notarytool submit Hitsudan.app.zip \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$KEY_ID" --issuer "$ISSUER_ID" \
+            --wait --timeout 30m
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+          # チケットをアプリに焼き付けてから固め直す。zip には staple できない。
+          xcrun stapler staple Hitsudan.app
+          xcrun stapler validate Hitsudan.app
+          rm -f Hitsudan.app.zip
+          ditto -c -k --keepParent Hitsudan.app Hitsudan.app.zip
+          spctl --assess --type execute --verbose=2 Hitsudan.app
+
       - uses: actions/upload-artifact@v4
         with:
           name: Hitsudan.app
           path: Hitsudan.app.zip
+
+      - name: Release に載せる
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME}"
+          signed=$(codesign -dvv Hitsudan.app 2>&1 | grep -c "Developer ID" || true)
+          if [ "$signed" -gt 0 ]; then
+            note="Developer ID で署名済み。タグを打った時点で公証も通しています。"
+          else
+            note="**アドホック署名です**（署名用の Secrets が未設定）。初回起動時に右クリック → 開く が必要で、再ビルドのたびに入力監視の許可を取り直すことになります。"
+          fi
+          gh release create "$tag" Hitsudan.app.zip \
+            --title "$tag" \
+            --notes "$(printf '%s\n\n%s\n\n%s' \
+              "筆談ボード $tag" \
+              "$note" \
+              "macOS 13 以降・ユニバーサル（Apple Silicon / Intel）。展開して /Applications に置き、システム設定 → プライバシーとセキュリティ → 入力監視 と アクセシビリティ を許可してください。")"

@@ -52,9 +52,19 @@ PLIST
 
 # A stable identity, not ad-hoc: an ad-hoc signature's cdhash changes on every
 # build, which silently revokes the Input Monitoring grant each time.
-IDENTITY="Hitsudan Local Signing"
+#
+# HITSUDAN_SIGN_IDENTITY overrides it — that is how CI signs with a Developer ID.
+# A Developer ID signature also needs the hardened runtime and a timestamp, or
+# notarisation refuses the submission.
+IDENTITY="${HITSUDAN_SIGN_IDENTITY:-Hitsudan Local Signing}"
+SIGN_FLAGS=()
+if [[ -n "${HITSUDAN_SIGN_IDENTITY:-}" ]]; then
+  SIGN_FLAGS=(--options runtime --timestamp)
+fi
+
 if security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
-  codesign --force --sign "$IDENTITY" "$APP"
+  codesign --force "${SIGN_FLAGS[@]}" --sign "$IDENTITY" "$APP"
+  echo "signed: $IDENTITY"
 else
   echo "warning: '$IDENTITY' が見つかりません。アドホック署名にフォールバックします"
   echo "         （再ビルドのたびに入力監視の許可が外れます。README の『署名鍵の再作成』参照）"
