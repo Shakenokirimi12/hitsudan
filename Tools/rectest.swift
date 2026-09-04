@@ -70,24 +70,56 @@ func makeWave() -> [CGPoint] {
 }
 
 let r = DollarRecognizer()
-let cases: [(String, () -> [CGPoint])] = [
-    ("直線", makeLine), ("円", makeCircle), ("四角", makeRect),
-    ("三角", makeTriangle), ("不定形", makeBlob),
-    ("なぐり書き", makeScribble), ("波線", makeWave),
+let threshold: CGFloat = 0.88
+
+/// 正しく整形されるべき形と、整形してはいけない形。CI はここで落ちる。
+let shouldSnap: [(String, Unistroke, () -> [CGPoint])] = [
+    ("直線", .line, makeLine),
+    ("円", .circle, makeCircle),
+    ("四角", .rectangle, makeRect),
+    ("三角", .triangle, makeTriangle),
 ]
-for (name, make) in cases {
-    var hits: [String: Int] = [:]
-    var scoreSum: CGFloat = 0
-    var minScore: CGFloat = 1, maxScore: CGFloat = 0
-    for _ in 0..<40 {
-        if let v = r.recognise(make()) {
-            hits[v.kind.rawValue, default: 0] += 1
-            scoreSum += v.score
-            minScore = min(minScore, v.score); maxScore = max(maxScore, v.score)
-        }
+let shouldNotSnap: [(String, () -> [CGPoint])] = [
+    ("不定形", makeBlob),
+    ("なぐり書き", makeScribble),
+    ("波線", makeWave),
+]
+
+var failures = 0
+let trials = 40
+
+for (name, expected, make) in shouldSnap {
+    var wrong = 0, below = 0
+    var worst: CGFloat = 1
+    for _ in 0..<trials {
+        guard let v = r.recognise(make()) else { wrong += 1; continue }
+        if v.kind != expected { wrong += 1 }
+        if v.score <= threshold { below += 1 }
+        worst = min(worst, v.score)
     }
-    let top = hits.max { $0.value < $1.value }
-    print(String(format: "%-12@ → %-10@ (%d/40)  平均 %.2f  最小 %.2f  最大 %.2f",
-                 name as NSString, (top?.key ?? "-") as NSString, top?.value ?? 0,
-                 scoreSum / 40, minScore, maxScore))
+    let ok = wrong == 0 && below == 0
+    if !ok { failures += 1 }
+    print(String(format: "%@ %-10@ → %@  誤判定 %d/%d  閾値割れ %d/%d  最小スコア %.3f",
+                 (ok ? "PASS" : "FAIL") as NSString, name as NSString,
+                 expected.rawValue as NSString, wrong, trials, below, trials, worst))
 }
+
+for (name, make) in shouldNotSnap {
+    var snapped = 0
+    var highest: CGFloat = 0
+    for _ in 0..<trials {
+        guard let v = r.recognise(make()) else { continue }
+        if v.score > threshold { snapped += 1 }
+        highest = max(highest, v.score)
+    }
+    let ok = snapped == 0
+    if !ok { failures += 1 }
+    print(String(format: "%@ %-10@ → 補正されない  誤補正 %d/%d  最大スコア %.3f",
+                 (ok ? "PASS" : "FAIL") as NSString, name as NSString, snapped, trials, highest))
+}
+
+if failures > 0 {
+    FileHandle.standardError.write("\n\(failures) 件の判定が期待どおりではありません\n".data(using: .utf8)!)
+    exit(1)
+}
+print("\nすべて期待どおり（閾値 \(threshold)）")

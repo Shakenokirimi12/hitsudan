@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 環境
+        run: |
+          swift --version
+          sw_vers
+
+      - name: 図形認識のテスト
+        run: ./Tools/run-tests.sh
+
+      - name: ビルド
+        # 署名鍵はこの Mac のキーチェーンにしかないので、CI では
+        # build.sh がアドホック署名にフォールバックする（警告つき）。
+        run: ./build.sh
+
+      - name: 成果物を検証
+        run: |
+          set -e
+          binary=Hitsudan.app/Contents/MacOS/Hitsudan
+
+          echo "--- ユニバーサルか ---"
+          lipo -info "$binary"
+          lipo -info "$binary" | grep -q arm64
+          lipo -info "$binary" | grep -q x86_64
+
+          echo "--- 最小 OS が Info.plist の申告どおりか ---"
+          # 一度ここが 26.0 になっていて、plist の 13.0 が嘘になっていた
+          vtool -show-build "$binary" | grep -E "minos"
+          vtool -show-build "$binary" | grep -q "minos 13.0"
+          grep -A1 LSMinimumSystemVersion Hitsudan.app/Contents/Info.plist | grep -q 13.0
+
+          echo "--- アイコンが入っているか ---"
+          test -s Hitsudan.app/Contents/Resources/Hitsudan.icns
+
+      - name: MCP サーバの疎通確認
+        run: |
+          set -e
+          out=$(printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | ./hitsudan-mcp)
+          echo "$out"
+          for tool in read_board wait_for_board request_board collect_board show_on_board clear_board board_status; do
+            echo "$out" | grep -q "\"$tool\"" || { echo "ツール $tool が見当たりません"; exit 1; }
+          done
+
+      - name: アプリを固める
+        run: ditto -c -k --keepParent Hitsudan.app Hitsudan.app.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hitsudan.app
+          path: Hitsudan.app.zip
