@@ -17,6 +17,15 @@ let outbox = root.appendingPathComponent("outbox", isDirectory: true)
 let boardPNG = root.appendingPathComponent("board.png")
 let boardMeta = root.appendingPathComponent("board.json")
 let stateFile = root.appendingPathComponent("state.json")
+let requestsDir = root.appendingPathComponent("requests", isDirectory: true)
+
+/// This session's outstanding request, kept on disk so it survives the server
+/// process being restarted between asking and collecting.
+var requestFile: URL {
+    let who = (FileManager.default.currentDirectoryPath as NSString).lastPathComponent
+    let safe = who.replacingOccurrences(of: "/", with: "_")
+    return requestsDir.appendingPathComponent("\(safe.isEmpty ? "session" : safe).json")
+}
 
 // MARK: - Talking to the app
 
@@ -134,6 +143,44 @@ let tools: [[String: Any]] = [
                 "color": ["type": "string", "description": "依頼の間だけ借りる筆記具: black / red / blue / green / laser"],
                 "width": ["type": "number", "description": "同じく線の太さ 2〜140"],
                 "eraser": ["type": "boolean", "description": "同じく消しゴムにするか"],
+                "retain": ["type": "string", "description": "返信を描いたページをどうするか: keep=ノートに残す（既定） / temporary=送ったら消して元のページに戻る / ask=送ったあとユーザーに選ばせる"],
+            ],
+            "additionalProperties": false,
+        ],
+    ],
+    [
+        "name": "request_board",
+        "description": """
+        手書きを依頼して**すぐ返る**。ボードに依頼文が出て「送る」ボタンが現れるが、\
+        こちらは待たずに他の作業を続けられる。書けたかどうかは collect_board で回収する。\
+        wait_for_board と違ってセッションを塞がないので、時間のかかる依頼はこちらを使う。\
+        color を渡せばその筆記具を借りられる。
+        """,
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "prompt": ["type": "string", "description": "ボードに表示する依頼文"],
+                "lease_seconds": ["type": "number", "description": "依頼を掲示しておく秒数。既定 1800、上限 7200"],
+                "color": ["type": "string", "description": "借りる筆記具: black / red / blue / green / laser"],
+                "width": ["type": "number", "description": "線の太さ 2〜140"],
+                "eraser": ["type": "boolean", "description": "消しゴムにするか"],
+                "retain": ["type": "string", "description": "返信を描いたページをどうするか: keep=ノートに残す（既定） / temporary=送ったら消して元のページに戻る / ask=送ったあとユーザーに選ばせる"],
+            ],
+            "additionalProperties": false,
+        ],
+    ],
+    [
+        "name": "collect_board",
+        "description": """
+        request_board で出した依頼の答えを回収する。ユーザーが「送る」を押していれば\
+        その手書きを画像で返し、まだなら「まだ」とだけ返る（エラーではない）。\
+        待たずに何度でも呼べるので、他の作業の合間に確認するのに向く。\
+        wait_seconds を渡せばその秒数だけ待ってから返る。
+        """,
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "wait_seconds": ["type": "number", "description": "回収前に待つ秒数。既定 0、上限 300"],
             ],
             "additionalProperties": false,
         ],
@@ -160,6 +207,7 @@ let tools: [[String: Any]] = [
                 "color": ["type": "string", "description": "書き込んでほしい色を借りる: black / red / blue / green / laser"],
                 "width": ["type": "number", "description": "同じく線の太さ 2〜140"],
                 "eraser": ["type": "boolean", "description": "同じく消しゴムにするか"],
+                "retain": ["type": "string", "description": "返信を描いたページをどうするか: keep=ノートに残す（既定） / temporary=送ったら消して元のページに戻る / ask=送ったあとユーザーに選ばせる"],
             ],
             "additionalProperties": false,
         ],
@@ -175,6 +223,25 @@ let tools: [[String: Any]] = [
         "inputSchema": ["type": "object", "properties": [:] as [String: Any], "additionalProperties": false],
     ],
 ]
+
+/// Post the request to the board and remember where the counter stood, so a
+/// later collection can tell "they answered" from "nothing has happened yet".
+func postRequest(_ args: [String: Any], lease: Double) -> String? {
+    let cwd = FileManager.default.currentDirectoryPath
+    let label = (cwd as NSString).lastPathComponent
+    var request: [String: Any] = ["label": label, "cwd": cwd,
+                                  "prompt": (args["prompt"] as? String) ?? "",
+                                  "lease": lease]
+    if let retain = args["retain"] as? String, !retain.isEmpty { request["retain"] = retain }
+    guard command("wait", request) != nil else { return nil }
+    lendPen(args)
+    try? FileManager.default.createDirectory(at: requestsDir, withIntermediateDirectories: true)
+    let record: [String: Any] = ["seq": boardSeq,
+                                 "prompt": (args["prompt"] as? String) ?? "",
+                                 "at": ISO8601DateFormatter().string(from: Date())]
+    if let data = try? JSONSerialization.data(withJSONObject: record) { try? data.write(to: requestFile) }
+    return label
+}
 
 /// The pen is borrowed as part of a request, never on its own — nobody wants
 /// their colour changed while they are simply writing.
@@ -197,17 +264,34 @@ func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
         }
         return boardContent(header: "筆談ボードの現在の内容")
 
-    case "wait_for_board":
-        let prompt = args["prompt"] as? String
-        let limit = min(max((args["timeout_seconds"] as? Double) ?? 55, 5), 600)
-        // Claude Code starts an MCP server in the session's own directory, so
-        // the folder name is how the person recognises which session is asking.
-        let cwd = FileManager.default.currentDirectoryPath
-        let label = (cwd as NSString).lastPathComponent
-        guard command("wait", ["label": label, "cwd": cwd, "prompt": prompt ?? ""]) != nil else {
-            return failure(notRunning)
+    case "request_board":
+        let lease = min(max((args["lease_seconds"] as? Double) ?? 1800, 30), 7200)
+        guard let label = postRequest(args, lease: lease) else { return failure(notRunning) }
+        return ["content": [text("ボードに依頼を出しました（\(label)）。"
+            + "ユーザーが書いて「送る」を押したら collect_board で回収してください。"
+            + "こちらは待っていないので、先に別の作業を進めて構いません。")]]
+
+    case "collect_board":
+        guard let record = readJSON(requestFile), let asked = record["seq"] as? Int else {
+            return failure("回収できる依頼がありません。先に request_board を呼んでください。")
         }
-        lendPen(args)
+        let wait = min(max((args["wait_seconds"] as? Double) ?? 0, 0), 300)
+        let deadline = Date().addingTimeInterval(wait)
+        repeat {
+            if boardSeq > asked {
+                try? FileManager.default.removeItem(at: requestFile)
+                command("wait_end", [:])
+                let note = (readJSON(boardMeta)?["savedAt"] as? String) ?? ""
+                return boardContent(header: "ユーザーが送信した手書き（\(note)）")
+            }
+            if wait > 0 { Thread.sleep(forTimeInterval: 0.3) }
+        } while Date() < deadline
+        return ["content": [text("まだ書かれていません。依頼はボードに出したままなので、"
+            + "他の作業を進めてからもう一度 collect_board を呼んでください。")]]
+
+    case "wait_for_board":
+        let limit = min(max((args["timeout_seconds"] as? Double) ?? 55, 5), 600)
+        guard postRequest(args, lease: limit + 60) != nil else { return failure(notRunning) }
 
         let before = boardSeq
         let deadline = Date().addingTimeInterval(limit)
@@ -229,7 +313,7 @@ func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
 
     case "show_on_board":
         var payload: [String: Any] = [:]
-        for key in ["svg", "image_path", "text", "notice"] {
+        for key in ["svg", "image_path", "text", "notice", "retain"] {
             if let value = args[key] as? String, !value.isEmpty { payload[key] = value }
         }
         if let clear = args["clear_ink"] as? Bool { payload["clear_ink"] = clear }

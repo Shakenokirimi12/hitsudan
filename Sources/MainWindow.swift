@@ -158,9 +158,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let proposalLabel = NSTextField(labelWithString: "")
 
     /// What a session has asked to put on the sheet, waiting for a decision.
+    /// What becomes of the page a request is answered on.
+    private enum Retention: String {
+        case keep        // ノートに残す
+        case temporary   // 送ったら消えて、元のページに戻る
+        case ask         // 送ったあとユーザーに聞く
+    }
+
     private struct Proposal {
         let id: String
         let summary: String
+        var applyTitle = "適用"
+        var discardTitle = "破棄"
         /// Content from a session is rarely about the page in hand, so accepting
         /// it starts a fresh page instead of burying what is already there.
         let onNewPage: Bool
@@ -169,7 +178,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var proposal: Proposal?
     private var lastProposalID = ""
     private var lastProposalOutcome = ""
+    private var retention: Retention = .keep
+    /// The page a request pulled up, and where to go back to afterwards.
+    private var scratchPageID: String?
+    private var returnToPage: Int?
     private var readingClearWork: DispatchWorkItem?
+    private var pendingScratchDrop: String?
     /// What the pen was before a session borrowed it, and what the session set
     /// it to — so it can be handed back untouched, and only if the person has
     /// not since chosen something else themselves.
@@ -567,6 +581,37 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let work = DispatchWorkItem { [weak self] in self?.canvas.readingBy = nil }
         readingClearWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
+    }
+
+    /// Once the answer is sent, decide what happens to the page it was drawn on.
+    private func settleScratchPage(_ how: Retention) {
+        retention = .keep
+        guard let scratch = scratchPageID else { return }
+        switch how {
+        case .keep:
+            scratchPageID = nil
+            returnToPage = nil
+        case .temporary:
+            dropScratchPage()
+        case .ask:
+            propose("この下書きページを残しますか？", onNewPage: false,
+                    applyTitle: "残す", discardTitle: "破棄") { [weak self] in
+                self?.scratchPageID = nil
+                self?.returnToPage = nil
+            }
+            // Discarding the proposal is what throws the page away.
+            pendingScratchDrop = scratch
+        }
+    }
+
+    private func dropScratchPage() {
+        guard let scratch = scratchPageID else { return }
+        let back = returnToPage
+        scratchPageID = nil
+        returnToPage = nil
+        pages.delete(scratch)
+        openPage(back.map { min($0, pages.count - 1) } ?? pages.current)
+        statusLabel.stringValue = "一時ボードを片付けました"
     }
 
     private func clearWaiting() {
@@ -1281,10 +1326,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return ["ok": true]
 
         case "wait":
+            retention = Retention(rawValue: (args["retain"] as? String) ?? "") ?? .keep
+            if retention != .keep, scratchPageID == nil {
+                // Answer on a page of its own, so a throwaway reply never lands
+                // in the middle of whatever the notebook was being used for.
+                savePage()
+                returnToPage = pages.current
+                pages.appendPage()
+                openPage(pages.count - 1)
+                scratchPageID = pages.currentID
+            }
             waitingLabel = (args["label"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "セッション"
             // Each poll refreshes the lease, so a session that gives up quietly
             // stops being announced instead of waiting for ever.
-            waitingUntil = Date().addingTimeInterval(150)
+            waitingUntil = Date().addingTimeInterval((args["lease"] as? Double) ?? 150)
             let prompt = (args["prompt"] as? String) ?? ""
             canvas.notice = prompt.isEmpty ? "\(waitingLabel!) が手書きを待っています" : prompt
             comeForward()
@@ -1301,6 +1356,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return ["ok": true]
 
         case "show":
+            if let r = Retention(rawValue: (args["retain"] as? String) ?? "") { retention = r }
             var underlay: CGImage?
             if let svg = args["svg"] as? String {
                 let tmp = FileManager.default.temporaryDirectory
@@ -1400,9 +1456,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// person decides with a button big enough to hit with a pen.
     @discardableResult
     private func propose(_ summary: String, onNewPage: Bool = true,
+                         applyTitle: String = "適用", discardTitle: String = "破棄",
                          _ apply: @escaping () -> Void) -> String {
         let id = UUID().uuidString
-        proposal = Proposal(id: id, summary: summary, onNewPage: onNewPage, apply: apply)
+        proposal = Proposal(id: id, summary: summary, applyTitle: applyTitle,
+                            discardTitle: discardTitle, onNewPage: onNewPage, apply: apply)
+        applyButton.title = applyTitle
+        discardButton.title = discardTitle
         lastProposalID = id
         lastProposalOutcome = "pending"
         proposalLabel.stringValue = summary
@@ -1425,10 +1485,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         canvas.preview = nil
         if proposal.onNewPage {
             savePage()
+            let from = pages.current
             pages.appendPage()
             openPage(pages.count - 1)
+            if retention != .keep, scratchPageID == nil { returnToPage = from }
         }
         proposal.apply()
+        pendingScratchDrop = nil
+        if proposal.onNewPage, retention != .keep, scratchPageID == nil {
+            scratchPageID = pages.currentID
+        }
         lastProposalOutcome = "applied"
         endProposal()
         statusLabel.stringValue = proposal.onNewPage
@@ -1439,6 +1505,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         canvas.notice = nil
         lastProposalOutcome = "rejected"
         endProposal()
+        if pendingScratchDrop != nil {
+            pendingScratchDrop = nil
+            dropScratchPage()
+            return
+        }
         statusLabel.stringValue = "破棄しました"
     }
 
@@ -1561,8 +1632,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 return
             }
             let recipient = self.waitingLabel
+            let howToKeep = self.retention
             self.bridge.publish(png: png, note: recipient ?? "送る", bump: true)
             self.clearWaiting()
+            self.settleScratchPage(howToKeep)
             // Also on the clipboard, for a session with no MCP server.
             let pb = NSPasteboard.general
             pb.clearContents()
