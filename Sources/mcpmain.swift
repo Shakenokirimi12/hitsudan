@@ -150,6 +150,25 @@ let tools: [[String: Any]] = [
                 "text": ["type": "string", "description": "下敷きとして敷くテキスト"],
                 "notice": ["type": "string", "description": "ボード上部に出す一行"],
                 "clear_ink": ["type": "boolean", "description": "適用時に既存の手書きを消す。既定 false"],
+                "wait_seconds": ["type": "number", "description": "ユーザーの判断を待つ秒数。既定 0（待たずに返る）。上限 300"],
+            ],
+            "additionalProperties": false,
+        ],
+    ],
+    [
+        "name": "set_pen",
+        "description": """
+        ボードの筆記具を変える。色を指定してから wait_for_board で書いてもらうと、\
+        「赤で印を」と頼んだとおりの色で描いてもらえる。\
+        color: black / red / blue / green / laser（laser はインクを残さない指し棒）。\
+        width は 2〜140。eraser を true にすると消しゴムになる。すぐ反映される。
+        """,
+        "inputSchema": [
+            "type": "object",
+            "properties": [
+                "color": ["type": "string", "description": "black / red / blue / green / laser"],
+                "width": ["type": "number", "description": "線の太さ 2〜140"],
+                "eraser": ["type": "boolean", "description": "消しゴムにするか"],
             ],
             "additionalProperties": false,
         ],
@@ -168,8 +187,21 @@ let tools: [[String: Any]] = [
 
 func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
     switch name {
+    case "set_pen":
+        var payload: [String: Any] = [:]
+        if let c = args["color"] as? String { payload["color"] = c }
+        if let w = args["width"] as? Double { payload["width"] = w }
+        if let e = args["eraser"] as? Bool { payload["eraser"] = e }
+        guard !payload.isEmpty else { return failure("color / width / eraser のいずれかを指定してください") }
+        guard let reply = command("set_pen", payload) else { return failure(notRunning) }
+        if reply["ok"] as? Bool != true {
+            return failure((reply["error"] as? String) ?? "変更できませんでした")
+        }
+        return ["content": [text("筆記具を変更しました（太さ \(Int((reply["width"] as? Double) ?? 0))）")]]
+
     case "read_board":
-        guard let reply = command("capture") else { return failure(notRunning) }
+        let who = (FileManager.default.currentDirectoryPath as NSString).lastPathComponent
+        guard let reply = command("capture", ["label": who]) else { return failure(notRunning) }
         if reply["ok"] as? Bool != true {
             return failure((reply["error"] as? String) ?? "取得できませんでした")
         }
@@ -178,13 +210,19 @@ func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
     case "wait_for_board":
         let prompt = args["prompt"] as? String
         let limit = min(max((args["timeout_seconds"] as? Double) ?? 55, 5), 600)
-        guard command("focus") != nil else { return failure(notRunning) }
-        if let prompt { command("notice", ["text": prompt]) }
+        // Claude Code starts an MCP server in the session's own directory, so
+        // the folder name is how the person recognises which session is asking.
+        let cwd = FileManager.default.currentDirectoryPath
+        let label = (cwd as NSString).lastPathComponent
+        guard command("wait", ["label": label, "cwd": cwd, "prompt": prompt ?? ""]) != nil else {
+            return failure(notRunning)
+        }
 
         let before = boardSeq
         let deadline = Date().addingTimeInterval(limit)
         while Date() < deadline {
             if boardSeq > before {
+                command("wait_end", [:])
                 let note = (readJSON(boardMeta)?["savedAt"] as? String) ?? ""
                 return boardContent(header: "ユーザーが送信した手書き（\(note)）")
             }
@@ -211,7 +249,25 @@ func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
         if reply["ok"] as? Bool != true {
             return failure((reply["error"] as? String) ?? "ボードに送れませんでした")
         }
-        return ["content": [text("ボードにプレビューとして送りました。ユーザーが「適用」を押すまで確定しません。")]]
+        let id = (reply["proposalID"] as? String) ?? ""
+        let wait = min(max((args["wait_seconds"] as? Double) ?? 0, 0), 300)
+        guard wait > 0 else {
+            return ["content": [text("ボードにプレビューとして送りました。ユーザーが「適用」か「破棄」を押すまで確定しません。"
+                                     + "結果は board_status で確認できます。")]]
+        }
+
+        let deadline = Date().addingTimeInterval(wait)
+        while Date() < deadline {
+            if let s = command("status", [:], timeout: 3),
+               (s["proposalID"] as? String) == id,
+               let outcome = s["proposalOutcome"] as? String, outcome != "pending" {
+                return ["content": [text(outcome == "applied"
+                    ? "ユーザーが適用しました。内容は新しいページに置かれています。"
+                    : "ユーザーが破棄しました。ボードは変わっていません。")]]
+            }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        return ["content": [text("まだ判断されていません。board_status で結果を確認できます。")]]
 
     case "clear_board":
         guard let reply = command("clear") else { return failure(notRunning) }
@@ -224,12 +280,21 @@ func call(_ name: String, _ args: [String: Any]) -> [String: Any] {
         let live = command("status", [:], timeout: 3)
         let snapshot = live ?? readJSON(stateFile)
         guard let snapshot else { return failure(notRunning) }
+        let proposalText: String
+        switch snapshot["proposalOutcome"] as? String ?? "" {
+        case "pending": proposalText = "判断待ち"
+        case "applied": proposalText = "適用された"
+        case "rejected": proposalText = "破棄された"
+        default: proposalText = "なし"
+        }
         let lines = [
             "アプリ: \(live != nil ? "応答あり" : "無応答（state.json の最終値）")",
             "タブレット: \((snapshot["tabletPresent"] as? Bool ?? false) ? "接続" : "未接続")",
             "ストローク数: \(snapshot["strokes"] as? Int ?? 0)",
             "下敷き: \((snapshot["hasBackground"] as? Bool ?? false) ? "あり" : "なし")",
             "未処理の提案: \((snapshot["pendingProposal"] as? Bool ?? false) ? "あり" : "なし")",
+            "待機中のセッション: \({ let w = snapshot["waitingFor"] as? String ?? ""; return w.isEmpty ? "なし" : w }())",
+            "直前の提案: \(proposalText)",
             "カーソル操作: \((snapshot["pointerEnabled"] as? Bool ?? false) ? "ON" : "OFF")",
             "公開済み seq: \(snapshot["seq"] as? Int ?? 0)",
         ]

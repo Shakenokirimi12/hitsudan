@@ -30,8 +30,9 @@ final class CanvasView: NSView {
     var snapsShapes = true
     var onSnap: ((String) -> Void)?
 
-    /// Laser mode: the pen leaves no ink, only a red spot with a short trail —
-    /// for pointing at something on screen rather than marking it.
+    /// Laser mode: the pen leaves no ink, only a red spot with a short trail.
+    /// Driven by the tip switch exactly like drawing is — you point by touching
+    /// the screen, and the tail fades as soon as the nib lifts.
     var laserMode = false {
         didSet {
             if !laserMode { laserTrail.removeAll(); needsDisplay = true }
@@ -43,6 +44,16 @@ final class CanvasView: NSView {
 
     /// A line from the session, shown across the top of the sheet.
     var notice: String? { didSet { needsDisplay = true } }
+    /// Set while a session is taking a copy of the sheet, so being read is
+    /// something you can see rather than something that happens silently.
+    var readingBy: String? {
+        didSet {
+            if readingBy != nil { readingSince = Date(); startReadingPulse() }
+            needsDisplay = true
+        }
+    }
+    private var readingSince = Date()
+    private var readingTimer: Timer?
     /// Something a session wants to put on the sheet, shown faintly until the
     /// person accepts it. Never applied on its own.
     var preview: CGImage? { didSet { needsDisplay = true } }
@@ -58,6 +69,10 @@ final class CanvasView: NSView {
     /// The corner (or end) the snapped shape is pinned to while it is adjusted.
     private var snapAnchor: CGPoint?
     private var lastMovement = Date()
+    /// How much of the stroke was drawn before the pen settled. The samples
+    /// that pile up while holding still are what triggers the snap; they are
+    /// not part of the shape and must not be judged as if they were.
+    private var movedUpTo = 0
     private var holdTimer: Timer?
     private var snapped: ShapeKind?
 
@@ -166,6 +181,19 @@ final class CanvasView: NSView {
         if laserTrail.count > 120 { laserTrail.removeFirst(laserTrail.count - 120) }
     }
 
+    private func startReadingPulse() {
+        readingTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.readingBy != nil else {
+                self.readingTimer?.invalidate(); self.readingTimer = nil; return
+            }
+            self.needsDisplay = true
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        readingTimer = timer
+    }
+
     private func startLaserFade() {
         laserTimer?.invalidate()
         let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
@@ -191,6 +219,7 @@ final class CanvasView: NSView {
         strokeStart = start
         snapAnchor = nil
         snapped = nil
+        movedUpTo = 1
         lastMovement = Date()
         startHoldWatch()
         if live!.erase { burnLive() }
@@ -201,18 +230,25 @@ final class CanvasView: NSView {
         guard !laserMode, live != nil else { return }
         let point = toPaper(viewPoint)
 
-        // Once snapped, the gesture keeps steering the shape rather than adding
-        // to it — the same way a snapped shape stays adjustable until you lift.
-        if let kind = snapped, let anchor = snapAnchor {
-            live!.points = idealShape(kind, from: anchor, to: point, width: averageWidth())
-            needsDisplay = true
+        // Once snapped, the gesture steers the shape instead of adding to it.
+        // A triangle has no single corner a drag could sensibly steer, so it is
+        // simply frozen — but it must still stop accepting points, or the raw
+        // stroke carries on being appended to the tidied shape.
+        if let kind = snapped {
+            if let anchor = snapAnchor {
+                live!.points = idealShape(kind, from: anchor, to: point, width: averageWidth())
+                needsDisplay = true
+            }
             return
         }
 
         let previous = live!.points.last!
         let next = Point(p: point, w: w)
         live!.points.append(next)
-        if hypot(next.p.x - previous.p.x, next.p.y - previous.p.y) > 2.5 { lastMovement = Date() }
+        if hypot(next.p.x - previous.p.x, next.p.y - previous.p.y) > 2.5 {
+            lastMovement = Date()
+            movedUpTo = live!.points.count
+        }
         if live!.erase { burnLive() }
         setNeedsDisplay(dirtyRect(previous, next))
     }
@@ -402,6 +438,38 @@ final class CanvasView: NSView {
             g.restoreGState()
         }
 
+        if let readingBy {
+            // A band down the sheet, plus a pulsing tag: unmistakable, and gone
+            // again in a moment.
+            let phase = CGFloat((Date().timeIntervalSince(readingSince) * 1.6).truncatingRemainder(dividingBy: 1))
+            let teal = NSColor.hex(0x0CA678)
+            g.saveGState()
+            g.clip(to: r)
+            g.setStrokeColor(teal.withAlphaComponent(0.75).cgColor)
+            g.setLineWidth(3)
+            let sweep = r.minY + r.height * (1 - phase)
+            g.beginPath()
+            g.move(to: CGPoint(x: r.minX, y: sweep))
+            g.addLine(to: CGPoint(x: r.maxX, y: sweep))
+            g.strokePath()
+            g.setStrokeColor(teal.withAlphaComponent(0.9).cgColor)
+            g.setLineWidth(4)
+            g.stroke(r.insetBy(dx: 2, dy: 2))
+
+            let tag = "\(readingBy) が読み取り中"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 15, weight: .semibold),
+                .foregroundColor: NSColor.white,
+            ]
+            let size = (tag as NSString).size(withAttributes: attrs)
+            let pill = NSRect(x: r.maxX - size.width - 40, y: r.maxY - 46,
+                              width: size.width + 26, height: 32)
+            g.setFillColor(teal.cgColor)
+            NSBezierPath(roundedRect: pill, xRadius: 16, yRadius: 16).fill()
+            (tag as NSString).draw(at: NSPoint(x: pill.minX + 13, y: pill.minY + 7), withAttributes: attrs)
+            g.restoreGState()
+        }
+
         if let notice, !notice.isEmpty {
             let band = NSRect(x: r.minX, y: r.maxY - 62, width: r.width, height: 62)
             g.setFillColor(NSColor(srgbRed: 0.04, green: 0.44, blue: 0.37, alpha: 0.94).cgColor)
@@ -475,7 +543,9 @@ final class CanvasView: NSView {
     private func trySnap() {
         guard let stroke = live, !stroke.erase, stroke.points.count >= 10,
               let start = strokeStart else { return }
-        let points = stroke.points.map(\.p)
+        let drawn = Array(stroke.points.prefix(max(movedUpTo, 2)))
+        guard drawn.count >= 10 else { return }
+        let points = drawn.map(\.p)
 
         var length: CGFloat = 0
         for i in 1..<points.count {
@@ -543,19 +613,23 @@ final class CanvasView: NSView {
     /// The widest triangle the stroke covers: the two furthest points make the
     /// base, and the point furthest from that line is the apex.
     private func triangle(through points: [CGPoint], width w: CGFloat) -> [Point] {
-        var a = points[0], b = points[0]
+        // The corner search is quadratic, and the raw feed can hand us hundreds
+        // of points; a thinned copy locates the same corners.
+        let step = max(points.count / 64, 1)
+        let sparse = stride(from: 0, to: points.count, by: step).map { points[$0] }
+        var a = sparse[0], b = sparse[0]
         var best: CGFloat = 0
-        for i in 0..<points.count {
-            for j in (i + 1)..<points.count {
-                let d = hypot(points[j].x - points[i].x, points[j].y - points[i].y)
-                if d > best { best = d; a = points[i]; b = points[j] }
+        for i in 0..<sparse.count {
+            for j in (i + 1)..<sparse.count {
+                let d = hypot(sparse[j].x - sparse[i].x, sparse[j].y - sparse[i].y)
+                if d > best { best = d; a = sparse[i]; b = sparse[j] }
             }
         }
         let dx = b.x - a.x, dy = b.y - a.y
         let base = max(hypot(dx, dy), 0.0001)
-        var apex = points[0]
+        var apex = sparse[0]
         var furthest: CGFloat = 0
-        for p in points {
+        for p in sparse {
             let d = abs(dy * (p.x - a.x) - dx * (p.y - a.y)) / base
             if d > furthest { furthest = d; apex = p }
         }
@@ -573,7 +647,7 @@ final class CanvasView: NSView {
     private func idealShape(_ kind: ShapeKind, from a: CGPoint, to b: CGPoint, width w: CGFloat) -> [Point] {
         switch kind {
         case .triangle:
-            return live?.points ?? []
+            return live?.points ?? []   // frozen at the moment it snapped
         case .line:
             return (0...48).map { i in
                 let t = CGFloat(i) / 48

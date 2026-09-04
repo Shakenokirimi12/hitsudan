@@ -159,10 +159,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// What a session has asked to put on the sheet, waiting for a decision.
     private struct Proposal {
+        let id: String
         let summary: String
+        /// Content from a session is rarely about the page in hand, so accepting
+        /// it starts a fresh page instead of burying what is already there.
+        let onNewPage: Bool
         let apply: () -> Void
     }
     private var proposal: Proposal?
+    private var lastProposalID = ""
+    private var lastProposalOutcome = ""
+    private var readingClearWork: DispatchWorkItem?
 
     private enum SendState { case ready, sending, sent }
     private var sendState: SendState = .ready { didSet { applySendState() } }
@@ -187,6 +194,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var panelView: NSView?
     private var bottomBar: NSView?
     private var cleanMode = false
+    /// Which session, if any, is sitting in wait_for_board right now.
+    private var waitingLabel: String?
+    private var waitingUntil = Date.distantPast
 
     private let widgetStack = NSStackView()
     private var widgets: [WidgetView] = []
@@ -545,16 +555,41 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: - Send button state
 
+    /// A session reading the sheet is worth seeing happen — otherwise the board
+    /// is silently photographed and nothing on screen says so.
+    private func showReading(_ who: String) {
+        canvas.readingBy = who
+        readingClearWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.canvas.readingBy = nil }
+        readingClearWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
+    }
+
+    private func clearWaiting() {
+        guard waitingLabel != nil else { return }
+        waitingLabel = nil
+        waitingUntil = .distantPast
+        canvas.notice = nil
+        applySendState()
+    }
+
     private func applySendState() {
         spinTimer?.invalidate()
         spinTimer = nil
         sendButton.iconAngle = 0
         switch sendState {
         case .ready:
-            sendButton.title = "送る"
-            sendButton.icon = Lucide.image(Lucide.send, size: 24, color: .white)
+            // Nobody asked: pressing this is still useful, but it is a copy to
+            // the clipboard, not an answer to anyone. Say so rather than
+            // offering a green button that goes nowhere.
+            let requested = waitingLabel != nil
+            sendButton.title = requested ? "送る → \(waitingLabel!)" : "クリップボードへ"
+            sendButton.isSecondary = !requested
+            sendButton.icon = Lucide.image(Lucide.send, size: 24,
+                                           color: requested ? .white : .labelColor)
             sendButton.fill = .hex(0x0CA678)
         case .sending:
+            sendButton.isSecondary = false
             sendButton.title = "送信中"
             sendButton.icon = Lucide.image(Lucide.loaderCircle, size: 24, color: .white, strokeWidth: 2.4)
             sendButton.fill = .hex(0x0CA678)
@@ -564,7 +599,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             RunLoop.main.add(spin, forMode: .common)
             spinTimer = spin
         case .sent:
-            sendButton.title = "送信済み"
+            sendButton.isSecondary = false
+            sendButton.title = waitingLabel == nil ? "コピーしました" : "送信済み"
             sendButton.icon = Lucide.image(Lucide.check, size: 26, color: .white, strokeWidth: 2.6)
             sendButton.fill = .hex(0x2F9E44)   // Open Color green 8
         }
@@ -1077,7 +1113,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.pointer.handle(s)
 
             if self.canvas.laserMode {
-                self.canvas.updateLaser(paper: s.inRange ? self.canvasPaperPoint(for: s) : nil)
+                // Same trigger as drawing: the spot appears where the nib
+                // touches, and the tail fades once it lifts.
+                self.canvas.updateLaser(paper: s.tip ? self.canvasPaperPoint(for: s) : nil)
             }
 
             let now = (s.button1, s.button2, s.button3)
@@ -1143,6 +1181,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let watchdog = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             for w in self.widgets where !w.isHidden { w.refresh() }
+            if self.waitingLabel != nil, Date() > self.waitingUntil { self.clearWaiting() }
             guard Date().timeIntervalSince(self.lastSampleAt) > 2.5 else { return }
             if self.canvas.ignoresMouse {
                 self.canvas.ignoresMouse = false
@@ -1169,6 +1208,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 "カーソル操作=\(self.pointer.isEnabled ? "ON" : "OFF")",
                 "アクセシビリティ=\(self.pointer.isTrusted ? "許可" : "未許可")",
                 "前面=\(self.isPresent ? "表示" : "常駐")",
+                "待機=\(self.waitingLabel ?? "なし")",
                 "最後の入力=\(self.lastInputNote)",
                 "覚えたキー=\(self.inputs.seenKeys.map { String(format: "%02x", $0) }.joined(separator: ","))",
             ].joined(separator: "  ")
@@ -1178,6 +1218,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             try? line.write(to: dir.appendingPathComponent("hid-status.log"),
                             atomically: true, encoding: .utf8)
             self.bridge.publish(state: [
+                "waitingFor": self.waitingLabel ?? "",
+                "proposalID": self.lastProposalID,
+                "proposalOutcome": self.lastProposalOutcome,
                 "tabletPresent": self.isPresent,
                 "strokes": self.canvas.strokeCount,
                 "hasBackground": self.canvas.backgroundImage != nil,
@@ -1201,10 +1244,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case "capture":
             guard let png = canvas.flattenedPNG() else { return ["ok": false, "error": "書き出せません"] }
             bridge.publish(png: png, note: "capture", bump: false)
+            showReading((args["label"] as? String) ?? waitingLabel ?? "Claude")
             return ["ok": true]
 
         case "clear":
-            propose("セッションがボードの消去を求めています") { [weak self] in
+            propose("セッションがボードの消去を求めています", onNewPage: false) { [weak self] in
                 self?.canvas.clearAll()
                 self?.canvas.notice = nil
             }
@@ -1213,6 +1257,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case "focus":
             comeForward()
             NSApp.activate(ignoringOtherApps: true)
+            return ["ok": true]
+
+        case "wait":
+            waitingLabel = (args["label"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "セッション"
+            // Each poll refreshes the lease, so a session that gives up quietly
+            // stops being announced instead of waiting for ever.
+            waitingUntil = Date().addingTimeInterval(150)
+            let prompt = (args["prompt"] as? String) ?? ""
+            canvas.notice = prompt.isEmpty ? "\(waitingLabel!) が手書きを待っています" : prompt
+            comeForward()
+            NSApp.activate(ignoringOtherApps: true)
+            applySendState()
+            return ["ok": true]
+
+        case "wait_end":
+            clearWaiting()
             return ["ok": true]
 
         case "notice":
@@ -1238,13 +1298,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             } else if let text = args["text"] as? String {
                 let clearInk = args["clear_ink"] as? Bool == true
                 let note = args["notice"] as? String
-                propose(args["notice"] as? String ?? "セッションがテキストを送ってきました") { [weak self] in
+                let id = propose(args["notice"] as? String ?? "セッションがテキストを送ってきました") { [weak self] in
                     guard let self else { return }
                     if clearInk { self.canvas.clearInkOnly() }
                     self.canvas.setBackgroundText(text)
                     self.canvas.notice = note
                 }
-                return ["ok": true, "pending": true]
+                return ["ok": true, "pending": true, "proposalID": id]
             } else {
                 return ["ok": false, "error": "svg / image_path / text のいずれかが必要です"]
             }
@@ -1252,17 +1312,46 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             let clearInk = args["clear_ink"] as? Bool == true
             let note = args["notice"] as? String
             canvas.preview = underlay
-            propose(note ?? "セッションが下敷きを送ってきました") { [weak self] in
+            let id = propose(note ?? "セッションが下敷きを送ってきました") { [weak self] in
                 guard let self else { return }
                 if clearInk { self.canvas.clearInkOnly() }
                 self.canvas.setBackground(underlay)
                 self.canvas.notice = note
             }
-            return ["ok": true, "pending": true]
+            return ["ok": true, "pending": true, "proposalID": id]
+
+        case "set_pen":
+            if let name = (args["color"] as? String)?.lowercased() {
+                let index: Int?
+                switch name {
+                case "black", "ink", "墨", "黒": index = 0
+                case "red", "朱", "赤": index = 1
+                case "blue", "青": index = 2
+                case "green", "緑": index = 3
+                case "laser", "レーザー": index = 4
+                default: index = nil
+                }
+                guard let index, swatches.indices.contains(index) else {
+                    return ["ok": false, "error": "色は black / red / blue / green / laser のいずれかです"]
+                }
+                pickColor(swatches[index])
+            }
+            if let width = args["width"] as? Double, width > 0 {
+                widthDial.doubleValue = width
+                applyWidth()
+            }
+            if let eraser = args["eraser"] as? Bool {
+                canvas.eraserSelected = eraser
+                modeControl?.selectedSegment = eraser ? 1 : 0
+            }
+            return ["ok": true, "width": widthDial.doubleValue]
 
         case "status":
             return [
                 "ok": true,
+                "waitingFor": waitingLabel ?? "",
+                "proposalID": lastProposalID,
+                "proposalOutcome": lastProposalOutcome,
                 "pendingProposal": proposal != nil,
                 "tabletPresent": isPresent,
                 "strokes": canvas.strokeCount,
@@ -1277,13 +1366,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// A session never overwrites the sheet on its own: it offers, and the
     /// person decides with a button big enough to hit with a pen.
-    private func propose(_ summary: String, _ apply: @escaping () -> Void) {
-        proposal = Proposal(summary: summary, apply: apply)
+    @discardableResult
+    private func propose(_ summary: String, onNewPage: Bool = true,
+                         _ apply: @escaping () -> Void) -> String {
+        let id = UUID().uuidString
+        proposal = Proposal(id: id, summary: summary, onNewPage: onNewPage, apply: apply)
+        lastProposalID = id
+        lastProposalOutcome = "pending"
         proposalLabel.stringValue = summary
         for v in [proposalLabel, applyButton, discardButton] as [NSView] { v.isHidden = false }
         canvas.notice = summary
         comeForward()
         NSApp.activate(ignoringOtherApps: true)
+        return id
     }
 
     private func endProposal() {
@@ -1295,13 +1390,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     @objc private func applyProposal(_ sender: Any?) {
         guard let proposal else { return }
         canvas.preview = nil
+        if proposal.onNewPage {
+            savePage()
+            pages.appendPage()
+            openPage(pages.count - 1)
+        }
         proposal.apply()
+        lastProposalOutcome = "applied"
         endProposal()
-        statusLabel.stringValue = "適用しました"
+        statusLabel.stringValue = proposal.onNewPage
+            ? "新しいページ \(pages.current + 1) に適用しました" : "適用しました"
     }
 
     @objc private func discardProposal(_ sender: Any?) {
         canvas.notice = nil
+        lastProposalOutcome = "rejected"
         endProposal()
         statusLabel.stringValue = "破棄しました"
     }
@@ -1420,7 +1523,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self.statusLabel.stringValue = "画像を書き出せません"
                 return
             }
-            self.bridge.publish(png: png, note: "送る", bump: true)
+            let recipient = self.waitingLabel
+            self.bridge.publish(png: png, note: recipient ?? "送る", bump: true)
+            self.clearWaiting()
             // Also on the clipboard, for a session with no MCP server.
             let pb = NSPasteboard.general
             pb.clearContents()
@@ -1429,7 +1534,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             // Hold the spinner long enough to be read as a state, not a flicker.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 self.sendState = .sent
-                self.statusLabel.stringValue = "送信しました（⌘V でも貼れます）"
+                self.statusLabel.stringValue = recipient.map { "\($0) へ送信しました" }
+                    ?? "クリップボードにコピーしました（セッションで ⌘V）"
             }
         }
     }
@@ -1505,7 +1611,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         hid.setSeizing(true)
         pointer.isEnabled = true
-        canvas.ignoresMouse = false
         saveSettings()
         statusLabel.stringValue = "ペンでカーソル操作中"
     }
@@ -1520,10 +1625,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func drivePen(with s: PenSample) {
-        guard !pointer.isEnabled else {
-            canvas.ignoresMouse = false
-            return
-        }
+        // Even with the pointer driver running, strokes come from the raw feed
+        // rather than from our own synthesized mouse events: macOS coalesces
+        // dragged events, so a 200 Hz pen arrives back as a few dozen scattered
+        // points. Drawing from the samples keeps every one of them.
         guard let screen = penScreen, let window = self.window else { return }
         canvas.ignoresMouse = true
         let frame = screen.frame
