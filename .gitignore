@@ -4,3 +4,12 @@ hitsudan-mcp
 *.iconset/
 
 .DS_Store
+
+# 署名鍵の類。実際の置き場は ~/.hitsudan/signing/ でリポジトリの外だが、
+# 手元にコピーしたときに事故で入らないように。
+*.key
+*.p12
+*.p8
+*.cer
+*.pem
+*.csr
