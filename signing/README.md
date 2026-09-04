@@ -1,24 +1,15 @@
-# devid.csr — 一時的な受け渡し用
+# Developer ID 証明書の発行
 
-Developer ID 証明書を発行するための署名要求。**中身は公開鍵と名前だけで、秘密鍵は
-含まれていない**ので、このリポジトリに置いても資格情報の漏洩にはならない。
-
-置いてある理由は、証明書の発行を別の Mac のブラウザから行うため。AirDrop が
-使えない環境での受け渡し経路として git を使っている。
+秘密鍵 `devid.key` と対応する CSR `devid.csr` は `~/.hitsudan/signing/` にあり、
+ここ（リポジトリ）には**絶対に置かない**。同じ Mac 上で鍵を作って発行まで
+完結できるので、CSR をリポジトリ経由で受け渡す必要はない。
 
 ## 使い方
 
 1. https://developer.apple.com/account/resources/certificates/list
 2. ＋ → **Developer ID Application**（Apple Development ではない）
-3. このファイルをアップロードして `.cer` をダウンロード
+3. `~/.hitsudan/signing/devid.csr` をアップロードして `.cer` をダウンロード
+4. `~/.hitsudan/signing/` に保存し、鍵と結合して `.p12` を作る（`../README.md` の
+   「署名と公証に必要な Secrets」参照）
 
-## 使い終わったら消すこと
-
-用が済んだら削除する。CSR にはメールアドレスが入っているので、万一リポジトリを
-公開する場合に残しておく理由がない。
-
-```sh
-git rm signing/devid.csr && git commit -m "使い終わった CSR を削除" && git push
-```
-
-秘密鍵 `devid.key` は `~/.hitsudan/signing/` にあり、ここには**絶対に置かない**。
+鍵を紛失・失効させた場合は、この手順ごとやり直す（新しい CSR を作って再発行）。
