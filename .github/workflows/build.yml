@@ -67,9 +67,15 @@ jobs:
           lipo -info "$binary" | grep -q x86_64
 
           echo "--- 最小 OS が Info.plist の申告どおりか ---"
-          # 一度ここが 26.0 になっていて、plist の 13.0 が嘘になっていた
-          vtool -show-build "$binary" | grep -E "minos"
-          vtool -show-build "$binary" | grep -q "minos 13.0"
+          # 一度ここが 26.0 になっていて、plist の 13.0 が嘘になっていた。
+          # ユニバーサルバイナリだと vtool は両スライス分をまとめて出すので、
+          # 全体を grep すると片方だけ正しくても通ってしまう。1枚ずつ剥がす。
+          for arch in arm64 x86_64; do
+            lipo -thin "$arch" "$binary" -output "$RUNNER_TEMP/slice-$arch"
+            vtool -show-build "$RUNNER_TEMP/slice-$arch" | grep -E "minos"
+            vtool -show-build "$RUNNER_TEMP/slice-$arch" | grep -q "minos 13.0" \
+              || { echo "$arch スライスの minos が 13.0 ではありません"; exit 1; }
+          done
           grep -A1 LSMinimumSystemVersion Hitsudan.app/Contents/Info.plist | grep -q 13.0
 
           echo "--- アイコンが入っているか ---"
@@ -78,6 +84,14 @@ jobs:
           echo "--- 署名 ---"
           codesign -dvv Hitsudan.app 2>&1 | grep -E "Authority|Identifier|Runtime" || true
           codesign --verify --deep --strict --verbose=2 Hitsudan.app
+          # --verify はアドホック署名でも通る。Developer ID を要求したときに
+          # 本当にそれで署名されたかは、別に確かめないと分からない。
+          if [ -n "$SIGN_IDENTITY" ]; then
+            codesign -dvv Hitsudan.app 2>&1 | grep -q "Authority=Developer ID Application" \
+              || { echo "Developer ID を指定したのに、その署名になっていません"; exit 1; }
+            codesign -dvv Hitsudan.app 2>&1 | grep -q "flags=.*runtime" \
+              || { echo "ハードンドランタイムが付いていません（公証に通りません）"; exit 1; }
+          fi
 
       - name: MCP サーバの疎通確認
         run: |
@@ -128,15 +142,36 @@ jobs:
         run: |
           set -e
           tag="${GITHUB_REF_NAME}"
-          signed=$(codesign -dvv Hitsudan.app 2>&1 | grep -c "Developer ID" || true)
-          if [ "$signed" -gt 0 ]; then
-            note="Developer ID で署名済み。タグを打った時点で公証も通しています。"
+
+          # 「署名した」と「公証を通した」は別。公証は Secrets が揃っている
+          # タグのときだけ走るので、成果物そのものに聞いて書き分ける。
+          # stapler validate はチケットが焼かれている場合だけ成功する。
+          signed=0
+          if codesign -dvv Hitsudan.app 2>&1 | grep -q "Authority=Developer ID Application"; then
+            signed=1
+          fi
+          stapled=0
+          if xcrun stapler validate Hitsudan.app >/dev/null 2>&1; then
+            stapled=1
+          fi
+
+          if [ "$signed" -eq 1 ] && [ "$stapled" -eq 1 ]; then
+            note="Developer ID で署名し、公証（notarization）も通しています。そのまま開けます。"
+          elif [ "$signed" -eq 1 ]; then
+            note="Developer ID で署名済みですが、**公証は通っていません**（公証用の Secrets が未設定）。初回起動時に右クリック → 開く が必要です。"
           else
             note="**アドホック署名です**（署名用の Secrets が未設定）。初回起動時に右クリック → 開く が必要で、再ビルドのたびに入力監視の許可を取り直すことになります。"
           fi
-          gh release create "$tag" Hitsudan.app.zip \
-            --title "$tag" \
-            --notes "$(printf '%s\n\n%s\n\n%s' \
-              "筆談ボード $tag" \
-              "$note" \
-              "macOS 13 以降・ユニバーサル（Apple Silicon / Intel）。展開して /Applications に置き、システム設定 → プライバシーとセキュリティ → 入力監視 と アクセシビリティ を許可してください。")"
+
+          body=$(printf '%s\n\n%s\n\n%s' \
+            "筆談ボード $tag" \
+            "$note" \
+            "macOS 13 以降・ユニバーサル（Apple Silicon / Intel）。展開して /Applications に置き、システム設定 → プライバシーとセキュリティ → 入力監視 と アクセシビリティ を許可してください。")
+
+          # 同じタグでワークフローを再実行しても落ちないように、あれば貼り替える。
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" Hitsudan.app.zip --clobber
+            gh release edit "$tag" --title "$tag" --notes "$body"
+          else
+            gh release create "$tag" Hitsudan.app.zip --title "$tag" --notes "$body"
+          fi

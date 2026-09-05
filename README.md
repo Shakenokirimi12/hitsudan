@@ -285,13 +285,15 @@ tip ビットをそのまま使うのが最も軽い。
 
 ## CI
 
-`.github/workflows/build.yml`。`main` への push とタグで動く。
+`.github/workflows/build.yml`。`main` への push、`v*` タグ、プルリクエスト、
+手動実行（workflow_dispatch）で動く。
 
 - 図形認識の判定テスト（`Tools/run-tests.sh`）
 - ユニバーサルビルド
 - 成果物の検証 — arm64/x86_64 の両方が入っているか、`minos` が 13.0 で
   Info.plist の申告と一致するか（実体が 26.0 なのに plist が 13.0 と嘘を
-  ついていたことがある）、アイコンの有無、署名の検証
+  ついていたことがある。スライスごとに剥がして確かめる）、アイコンの有無、
+  署名の検証
 - MCP サーバに実際に JSON-RPC を流して 7 ツールを申告するか確認
 - `Hitsudan.app.zip` をアーティファクトに
 
@@ -303,8 +305,19 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ### 署名と公証に必要な Secrets
 
-未設定でも CI は通る（アドホック署名にフォールバックし、Release にもその旨が書かれる）。
-設定すると Developer ID 署名と公証が有効になる。
+`MACOS_SIGN_IDENTITY` が未設定なら CI は通る（アドホック署名にフォールバックし、
+Release にもその旨が書かれる）。設定すると Developer ID 署名と公証が有効になる。
+
+**指定した識別名がキーチェーンで見つからない場合、`build.sh` はアドホックに
+落ちずにその場で失敗する。** 黙って落ちると、署名済みのつもりのものが配られて
+しまうため。CI 側でも、`MACOS_SIGN_IDENTITY` を指定したときは実際に
+`Developer ID Application` で署名され、ハードンドランタイムが付いているかを
+確かめている（`codesign --verify` はアドホック署名でも通ってしまうので、
+それだけでは足りない）。
+
+Release ノートは成果物に聞いて書き分ける。署名の有無は `codesign`、公証の有無は
+`stapler validate` で判定するので、「署名だけして公証していない」状態
+（`APPLE_API_KEY_ID` などが未設定のままタグを打った場合）もそのまま書かれる。
 
 | Secret | 中身 |
 |---|---|

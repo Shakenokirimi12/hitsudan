@@ -58,13 +58,22 @@ PLIST
 # notarisation refuses the submission.
 IDENTITY="${HITSUDAN_SIGN_IDENTITY:-Hitsudan Local Signing}"
 SIGN_FLAGS=()
+REQUIRE_IDENTITY=0
 if [[ -n "${HITSUDAN_SIGN_IDENTITY:-}" ]]; then
+  # 明示的に指定された以上、見つからないのは設定ミス。ここで黙って
+  # アドホックに落ちると、CI が署名済みのつもりで配ってしまう。
+  REQUIRE_IDENTITY=1
   SIGN_FLAGS=(--options runtime --timestamp)
 fi
 
 if security find-certificate -c "$IDENTITY" >/dev/null 2>&1; then
   codesign --force "${SIGN_FLAGS[@]}" --sign "$IDENTITY" "$APP"
   echo "signed: $IDENTITY"
+elif (( REQUIRE_IDENTITY )); then
+  echo "error: HITSUDAN_SIGN_IDENTITY に指定された '$IDENTITY' に一致する証明書が" >&2
+  echo "       キーチェーンにありません。security find-identity -v -p codesigning に" >&2
+  echo "       出る文字列をそのまま指定してください。" >&2
+  exit 1
 else
   echo "warning: '$IDENTITY' が見つかりません。アドホック署名にフォールバックします"
   echo "         （再ビルドのたびに入力監視の許可が外れます。README の『署名鍵の再作成』参照）"
