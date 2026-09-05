@@ -52,7 +52,7 @@ Xcode 本体は不要（Command Line Tools のみで通る）。
 `hitsudan-mcp` は Swift 製・依存なしの stdio MCP サーバ。登録済み:
 
 ```sh
-claude mcp add --scope user hitsudan -- ~/Developer/hitsudan/hitsudan-mcp
+claude mcp add --scope user hitsudan -- ~/Development/hitsudan/hitsudan-mcp
 ```
 
 | ツール | 用途 |
@@ -75,7 +75,7 @@ exit 2 で叩き起こす。stderr の文面がそのままモデルに渡る。
 ```json
 "hooks": { "Stop": [ { "hooks": [ {
   "type": "command",
-  "command": "~/Developer/hitsudan/Tools/board-wake.sh",
+  "command": "~/Development/hitsudan/Tools/board-wake.sh",
   "asyncRewake": true,
   "timeout": 1830
 } ] } ] }
