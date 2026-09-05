@@ -103,6 +103,21 @@ final class TabletHID {
         retryTimer = timer
     }
 
+    /// IOKit のコールバックの中から状態を伝えるときは、必ずこれを通すこと。
+    ///
+    /// IOKit は削除・接続のコールバックを、自分の os_unfair_lock を握ったまま
+    /// 呼んでくる。そこから同期的に `onStatus` を投げると、受け手が
+    /// `evaluatePresence()` → `standDown()` → `setSeizing(false)` → `teardown()`
+    /// まで一息に進み、IOHIDManager を IOKit がまだ使っている最中に解放して
+    /// しまう。IOKit はコールバックから戻ったあと自分のロックを外そうとして、
+    /// 解放済みのメモリに触り「Unlock of an os_unfair_lock not owned by
+    /// current thread」で即死する（実際に4時間動かしたあとタブレットが外れて
+    /// 落ちた）。ラン ループの次の番まで遅らせて、IOKit の中から抜けきってから
+    /// 伝える。
+    private func notifyLater(_ message: String) {
+        DispatchQueue.main.async { [weak self] in self?.onStatus?(message) }
+    }
+
     private func teardown() {
         guard let mgr = manager else { return }
         IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
@@ -150,7 +165,7 @@ final class TabletHID {
             guard let ctx else { return }
             let hid = Unmanaged<TabletHID>.fromOpaque(ctx).takeUnretainedValue()
             hid.isConnected = false
-            hid.onStatus?("タブレット未接続")
+            hid.notifyLater("タブレット未接続")
         }, me)
 
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
@@ -181,7 +196,10 @@ final class TabletHID {
         if !isConnected {
             isConnected = true
             let name = (IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String) ?? "HUION"
-            onStatus?("\(name) 接続")
+            // attach もデバイス一致コールバックの中。ここから同期的に伝えると
+            // comeForward() → restoreSettings() → setSeizing(true) → teardown()
+            // と進んで、削除時とまったく同じ形で落ちる。
+            notifyLater("\(name) 接続")
         }
     }
 
