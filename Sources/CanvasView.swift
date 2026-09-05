@@ -559,7 +559,8 @@ final class CanvasView: NSView {
         // What was drawn is the recogniser's call; where and how big is ours.
         // Measured on synthetic strokes (Tools/rectest.swift): real shapes score
         // 0.93 and up, while blobs, scribbles and wavy lines top out at 0.84.
-        guard let verdict = recogniser.recognise(points), verdict.score > 0.88 else { return }
+        guard let verdict = recogniser.recognise(points),
+              verdict.score > DollarRecognizer.snapThreshold else { return }
         let kind: ShapeKind
         switch verdict.kind {
         case .line:

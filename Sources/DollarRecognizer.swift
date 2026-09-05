@@ -13,6 +13,11 @@ enum Unistroke: String {
 
 struct DollarRecognizer {
 
+    /// The score at which a stroke is confident enough to be replaced by an
+    /// ideal shape. Owned here rather than at the call site so that the
+    /// recogniser, the app and Tools/rectest.swift can never drift apart.
+    static let snapThreshold: CGFloat = 0.88
+
     private static let sampleCount = 64
     private static let squareSize: CGFloat = 250
     private static let halfDiagonal: CGFloat = 0.5 * (squareSize * squareSize * 2).squareRoot()
