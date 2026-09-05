@@ -8,7 +8,19 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 SOURCES=(Sources/TabletHID.swift Sources/PenPointer.swift Sources/CanvasView.swift
          Sources/BoardBridge.swift Sources/Widgets.swift Sources/InputMap.swift
          Sources/PageStore.swift Sources/DollarRecognizer.swift
+         Sources/Version.swift Sources/Updater.swift
          Sources/MainWindow.swift Sources/main.swift)
+
+# 自動更新はバージョンを比べて動くので、Info.plist の値が実物と合っていないと
+# 意味がない。CI はタグを HITSUDAN_VERSION で渡す。手元では直近のタグを拾い、
+# タグが無ければ 0.0.0（＝リリースがあれば必ず「更新あり」側になる）。
+VERSION="${HITSUDAN_VERSION:-$(git describe --tags --abbrev=0 2>/dev/null || true)}"
+VERSION="${VERSION#v}"
+VERSION="${VERSION:-0.0.0}"
+if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+  echo "error: バージョン '$VERSION' が数字とドットだけになっていません" >&2
+  exit 1
+fi
 
 # Without an explicit -target the SDK's own version becomes the minimum, so the
 # binary silently demands the OS it was built on while Info.plist claims 13.0.
@@ -28,7 +40,7 @@ swiftc -O -target "arm64-apple-macosx${DEPLOY}" Tools/makeicon.swift -o /tmp/hit
 /tmp/hitsudan-makeicon Resources/icon.svg /tmp/Hitsudan.iconset >/dev/null
 iconutil -c icns /tmp/Hitsudan.iconset -o "$APP/Contents/Resources/Hitsudan.icns"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -38,8 +50,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>Hitsudan</string>
   <key>CFBundleIdentifier</key><string>local.hitsudan.board</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -88,5 +100,5 @@ for ARCH in arm64 x86_64; do
 done
 lipo -create "/tmp/hitsudan-mcp-arm64" "/tmp/hitsudan-mcp-x86_64" -output hitsudan-mcp
 
-echo "built: $PWD/$APP"
+echo "built: $PWD/$APP (バージョン $VERSION)"
 echo "built: $PWD/hitsudan-mcp"

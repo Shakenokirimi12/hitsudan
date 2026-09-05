@@ -54,6 +54,9 @@ jobs:
       - name: ビルド
         env:
           HITSUDAN_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          # 自動更新はこの値を比べて動く。タグのときだけ本物を焼き込み、
+          # それ以外は build.sh 側の既定（直近タグ、無ければ 0.0.0）に任せる。
+          HITSUDAN_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
         run: ./build.sh
 
       - name: 成果物を検証
@@ -80,6 +83,17 @@ jobs:
 
           echo "--- アイコンが入っているか ---"
           test -s Hitsudan.app/Contents/Resources/Hitsudan.icns
+
+          echo "--- バージョンがタグと一致しているか ---"
+          # 自動更新はこの値だけを見て新旧を判断するので、ズレたまま配ると
+          # 更新に気づけない（あるいは延々と更新を勧める）ことになる。
+          plist_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+            Hitsudan.app/Contents/Info.plist)
+          echo "Info.plist: $plist_version"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            [ "$plist_version" = "${GITHUB_REF_NAME#v}" ] \
+              || { echo "タグ ${GITHUB_REF_NAME} と Info.plist の $plist_version が一致しません"; exit 1; }
+          fi
 
           echo "--- 署名 ---"
           codesign -dvv Hitsudan.app 2>&1 | grep -E "Authority|Identifier|Runtime" || true

@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if present { NSApp.activate(ignoringOtherApps: false) }
         }
         controller = board
+        UpdatePrompt.onStateChange = { [weak self] in self?.refresh() }
         refresh()
     }
 
@@ -91,8 +92,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
 
+        let update = NSMenuItem(title: UpdatePrompt.isBusy ? "更新を確認中…" : "アップデートを確認…",
+                                action: #selector(checkForUpdates(_:)), keyEquivalent: "")
+        update.target = self
+        update.isEnabled = !UpdatePrompt.isBusy
+        menu.addItem(update)
+
+        let version = NSMenuItem(title: "バージョン \(Updater.current)", action: nil, keyEquivalent: "")
+        version.isEnabled = false
+        menu.addItem(version)
+
+        menu.addItem(.separator())
+
         let quit = NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
+    }
+
+    @objc private func checkForUpdates(_ sender: Any?) {
+        UpdatePrompt.check()
     }
 
     @objc private func showBoard(_ sender: Any?) {
