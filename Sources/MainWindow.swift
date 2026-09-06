@@ -96,28 +96,57 @@ final class BigButton: NSButton {
         }
 
         let color: NSColor = isSecondary ? .labelColor : .white
+        // 収まらないぶんは末尾を省略する。これが無いと、送り先が付いて
+        // 「送る → <セッション名>」になったときに自然幅のまま描かれ、
+        // アイコンが左へはみ出してテキストが端で切れていた。
         let style = NSMutableParagraphStyle()
         style.alignment = .center
+        style.lineBreakMode = .byTruncatingTail
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font ?? NSFont.systemFont(ofSize: 17, weight: .semibold),
             .foregroundColor: isEnabled ? color : color.withAlphaComponent(0.4),
             .paragraphStyle: style,
         ]
-        let size = (title as NSString).size(withAttributes: attrs)
+        let padding: CGFloat = 12
+        let available = max(bounds.width - padding * 2, 0)
+        let natural = (title as NSString).size(withAttributes: attrs)
+
+        // アイコンだけのボタン（title が空）は、中央にアイコンを置いて終わり。
+        guard !title.isEmpty else {
+            if let icon { drawIcon(icon, centredAt: CGPoint(x: bounds.midX, y: bounds.midY)) }
+            return
+        }
 
         guard let icon else {
-            (title as NSString).draw(in: NSRect(x: 0, y: bounds.midY - size.height / 2,
-                                                width: bounds.width, height: size.height),
+            let width = min(natural.width, available)
+            (title as NSString).draw(in: NSRect(x: bounds.midX - width / 2,
+                                                y: bounds.midY - natural.height / 2,
+                                                width: width, height: natural.height),
                                      withAttributes: attrs)
             return
         }
 
         let gap: CGFloat = 12
-        let total = icon.size.width + gap + size.width
-        let originX = bounds.midX - total / 2
+        // テキストに回せるのは、アイコンと隙間を引いた残りだけ。
+        let textWidth = min(natural.width, max(available - icon.size.width - gap, 0))
+        let total = icon.size.width + gap + textWidth
+        let originX = max(bounds.midX - total / 2, padding)
 
+        drawIcon(icon, centredAt: CGPoint(x: originX + icon.size.width / 2, y: bounds.midY))
+
+        let leftAligned = NSMutableParagraphStyle()
+        leftAligned.alignment = .left
+        leftAligned.lineBreakMode = .byTruncatingTail
+        var textAttrs = attrs
+        textAttrs[.paragraphStyle] = leftAligned
+        (title as NSString).draw(in: NSRect(x: originX + icon.size.width + gap,
+                                            y: bounds.midY - natural.height / 2,
+                                            width: textWidth, height: natural.height),
+                                 withAttributes: textAttrs)
+    }
+
+    private func drawIcon(_ icon: NSImage, centredAt centre: CGPoint) {
         NSGraphicsContext.saveGraphicsState()
-        let centre = CGPoint(x: originX + icon.size.width / 2, y: bounds.midY)
         let transform = NSAffineTransform()
         transform.translateX(by: centre.x, yBy: centre.y)
         transform.rotate(byRadians: iconAngle)
@@ -125,15 +154,6 @@ final class BigButton: NSButton {
         transform.concat()
         icon.draw(in: NSRect(origin: .zero, size: icon.size))
         NSGraphicsContext.restoreGraphicsState()
-
-        let leftAligned = NSMutableParagraphStyle()
-        leftAligned.alignment = .left
-        var textAttrs = attrs
-        textAttrs[.paragraphStyle] = leftAligned
-        (title as NSString).draw(in: NSRect(x: originX + icon.size.width + gap,
-                                            y: bounds.midY - size.height / 2,
-                                            width: size.width + 2, height: size.height),
-                                 withAttributes: textAttrs)
     }
 }
 
