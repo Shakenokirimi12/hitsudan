@@ -235,7 +235,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var eraserHeldFrom: Bool?
     private var lastInputNote = "なし"
     private var panelView: NSView?
-    private var bottomBar: NSView?
     private var cleanMode = false
     /// Which session, if any, is sitting in wait_for_board right now.
     private var waitingLabel: String?
@@ -329,7 +328,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func setCleanMode(_ on: Bool) {
         cleanMode = on
         panelView?.isHidden = on
-        bottomBar?.isHidden = on
         statusLabel.stringValue = on ? "" : "操作パネルを表示しました"
     }
 
@@ -382,10 +380,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         shapeBox.action = #selector(shapeSnapToggled(_:))
         shapeBox.toolTip = "描いたあと、離さずに止めると直線・円・四角に整形します"
 
-        let bottomRow = NSStackView(views: [displayPopup, pointerBox, shapeBox, telemetry])
-        bottomRow.orientation = .horizontal
-        bottomRow.spacing = 14
-        bottomRow.alignment = .centerY
+        // ディスプレイ割当・カーソル操作・図形補正・ペンの生データは、常時見えて
+        // いる必要がない。画面下の帯をまるごと設定ウィンドウへ移してある
+        // （openInputSettings が組み立てる）。ここでは中身の設定だけ済ませる。
 
         let plus = PlusButton(target: self, action: #selector(newPage(_:)))
         canvas.addSubview(plus)
@@ -394,15 +391,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             plus.bottomAnchor.constraint(equalTo: canvas.bottomAnchor, constant: 30),
         ])
 
-        let left = NSStackView(views: [tools, canvas, bottomRow])
+        let left = NSStackView(views: [tools, canvas])
         left.orientation = .vertical
         left.alignment = .leading
         left.spacing = 10
         left.edgeInsets = NSEdgeInsets(top: 22, left: 20, bottom: 18, right: 8)
         left.setHuggingPriority(.defaultLow, for: .horizontal)
         tools.setContentHuggingPriority(.defaultHigh, for: .vertical)
-        bottomRow.setContentHuggingPriority(.defaultHigh, for: .vertical)
-        for row in [tools, canvas, bottomRow] as [NSView] {
+        for row in [tools, canvas] as [NSView] {
             row.widthAnchor.constraint(equalTo: left.widthAnchor, constant: -28).isActive = true
         }
         canvas.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -410,7 +406,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         let panel = buildPanel()
         panelView = panel
-        bottomBar = bottomRow
 
         let split = NSStackView(views: [left, panel])
         split.orientation = .horizontal
@@ -509,6 +504,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         widthDial.doubleValue = 7
         widthDial.onChange = { [weak self] in self?.applyWidth() }
 
+        // 筆圧カーブは一度決めたら滅多に触らないので、設定ウィンドウへ移した。
         for (title, _) in curves { curvePopup.addItem(withTitle: title) }
         curvePopup.selectItem(at: 1)
         curvePopup.controlSize = .large
@@ -516,7 +512,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         curvePopup.target = self
         curvePopup.action = #selector(curveChanged(_:))
         curvePopup.toolTip = "筆圧カーブ"
-        curvePopup.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        curvePopup.widthAnchor.constraint(equalToConstant: 220).isActive = true
 
         // Paging sits with the drawing tools, not off in the side column: it is
         // part of working on the sheet.
@@ -531,7 +527,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let row = NSStackView(views: [mode, swatchStack, widthDial, curvePopup,
+        let row = NSStackView(views: [mode, swatchStack, widthDial,
                                       prevPageButton, pageLabel, nextPageButton, spacer])
         row.orientation = .horizontal
         row.spacing = 12
@@ -1003,8 +999,38 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         stack.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let heading = NSTextField(labelWithString: "ボタン割り当て")
-        heading.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        func sectionHeading(_ text: String) -> NSTextField {
+            let label = NSTextField(labelWithString: text)
+            label.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+            return label
+        }
+        func labelled(_ text: String, _ control: NSView) -> NSStackView {
+            let label = NSTextField(labelWithString: text)
+            label.font = NSFont.systemFont(ofSize: 15)
+            label.widthAnchor.constraint(equalToConstant: 200).isActive = true
+            let row = NSStackView(views: [label, control])
+            row.orientation = .horizontal
+            row.spacing = 16
+            row.alignment = .centerY
+            return row
+        }
+
+        // 画面下にあった帯をここへ集約した。どれも一度決めたら触らないものなので、
+        // 描いている間ずっと出しておく理由がない。
+        stack.addArrangedSubview(sectionHeading("動作"))
+        stack.addArrangedSubview(labelled("ペンの割当先", displayPopup))
+        stack.addArrangedSubview(labelled("筆圧カーブ", curvePopup))
+        stack.addArrangedSubview(pointerBox)
+        stack.addArrangedSubview(shapeBox)
+        stack.addArrangedSubview(labelled("ペンの生データ", telemetry))
+
+        let divider = NSBox()
+        divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.widthAnchor.constraint(equalToConstant: 416).isActive = true
+        stack.addArrangedSubview(divider)
+
+        let heading = sectionHeading("ボタン割り当て")
         stack.addArrangedSubview(heading)
 
         let hint = NSTextField(labelWithString:
@@ -1015,10 +1041,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         stack.addArrangedSubview(hint)
 
         for (id, title) in rows {
-            let label = NSTextField(labelWithString: title)
-            label.font = NSFont.systemFont(ofSize: 15)
-            label.widthAnchor.constraint(equalToConstant: 200).isActive = true
-
             let popup = NSPopUpButton()
             popup.controlSize = .large
             popup.font = NSFont.systemFont(ofSize: 14)
@@ -1028,12 +1050,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             popup.action = #selector(assignmentChanged(_:))
             popup.identifier = NSUserInterfaceItemIdentifier(id)
             popup.widthAnchor.constraint(equalToConstant: 200).isActive = true
-
-            let row = NSStackView(views: [label, popup])
-            row.orientation = .horizontal
-            row.spacing = 16
-            row.alignment = .centerY
-            stack.addArrangedSubview(row)
+            stack.addArrangedSubview(labelled(title, popup))
         }
 
         let assignColours = BigButton(title: "本体キーを押した順に色1〜5へ割り当て", height: 52, fontSize: 15,
