@@ -64,7 +64,8 @@ final class BigButton: NSButton {
     /// Radians. The loader spins by advancing this.
     var iconAngle: CGFloat = 0 { didSet { needsDisplay = true } }
 
-    init(title: String, height: CGFloat, fontSize: CGFloat, target: AnyObject?, action: Selector) {
+    init(title: String, height: CGFloat, fontSize: CGFloat, target: AnyObject?, action: Selector,
+         heightPriority: NSLayoutConstraint.Priority = .required) {
         super.init(frame: .zero)
         self.title = title
         self.target = target
@@ -72,7 +73,11 @@ final class BigButton: NSButton {
         isBordered = false
         font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
         translatesAutoresizingMaskIntoConstraints = false
-        heightAnchor.constraint(equalToConstant: height).isActive = true
+        // 優先度は作る時点で決める。アクティブな制約を required から下げるのは
+        // AppKit が禁じていて、環境によっては例外になる。
+        let heightConstraint = heightAnchor.constraint(equalToConstant: height)
+        heightConstraint.priority = heightPriority
+        heightConstraint.isActive = true
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -440,9 +445,37 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return b
     }
 
+    private func pageButton(_ icon: [String], _ tooltip: String, _ action: Selector) -> BigButton {
+        let button = BigButton(title: "", height: 48, fontSize: 20, target: self, action: action)
+        button.isSecondary = true
+        let image = Lucide.image(icon, size: 22, color: .labelColor, strokeWidth: 2)
+        image?.isTemplate = true
+        button.icon = image
+        button.toolTip = tooltip
+        button.widthAnchor.constraint(equalToConstant: 62).isActive = true
+        return button
+    }
+
     private func buildToolbar() -> NSView {
-        let mode = NSSegmentedControl(labels: ["ペン", "消しゴム"], trackingMode: .selectOne,
+        // ペン/消しゴムもアイコンだけにする。文字を読ませるより形で分かるほうが
+        // 速く、バーの横幅も空く。名前はツールチップに残す。
+        let penIcon = Lucide.image(Lucide.pen, size: 22, color: .labelColor, strokeWidth: 1.8)
+        let eraserIcon = Lucide.image(Lucide.eraser, size: 22, color: .labelColor, strokeWidth: 1.8)
+        penIcon?.isTemplate = true
+        eraserIcon?.isTemplate = true
+        let mode: NSSegmentedControl
+        if let penIcon, let eraserIcon {
+            mode = NSSegmentedControl(images: [penIcon, eraserIcon], trackingMode: .selectOne,
                                       target: self, action: #selector(modeChanged(_:)))
+            mode.setToolTip("ペン", forSegment: 0)
+            mode.setToolTip("消しゴム", forSegment: 1)
+            mode.setWidth(72, forSegment: 0)
+            mode.setWidth(72, forSegment: 1)
+        } else {
+            // アイコンを描けない環境では、従来どおり文字で出す。
+            mode = NSSegmentedControl(labels: ["ペン", "消しゴム"], trackingMode: .selectOne,
+                                      target: self, action: #selector(modeChanged(_:)))
+        }
         mode.selectedSegment = 0
         mode.controlSize = .large
         mode.font = NSFont.systemFont(ofSize: 15)
@@ -487,14 +520,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         // Paging sits with the drawing tools, not off in the side column: it is
         // part of working on the sheet.
-        prevPageButton = BigButton(title: "◀", height: 48, fontSize: 20,
-                                   target: self, action: #selector(previousPage(_:)))
-        prevPageButton.isSecondary = true
-        prevPageButton.widthAnchor.constraint(equalToConstant: 62).isActive = true
-        nextPageButton = BigButton(title: "▶", height: 48, fontSize: 20,
-                                   target: self, action: #selector(nextPage(_:)))
-        nextPageButton.isSecondary = true
-        nextPageButton.widthAnchor.constraint(equalToConstant: 62).isActive = true
+        prevPageButton = pageButton(Lucide.chevronLeft, "前のページ（[）", #selector(previousPage(_:)))
+        nextPageButton = pageButton(Lucide.chevronRight, "次のページ（]）", #selector(nextPage(_:)))
 
         pageLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 20, weight: .medium)
         pageLabel.alignment = .center
@@ -512,9 +539,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return row
     }
 
-    private func actionButton(_ title: String, _ action: Selector) -> BigButton {
-        let button = BigButton(title: title, height: 58, fontSize: 16, target: self, action: action)
+    /// 右パネルの操作ボタン。ラベルを外してアイコンだけにし、そのぶん背を高く
+    /// してある。ペンで狙う的なので、小さい文字を読ませるより面積を稼ぐほうが
+    /// 速い。名前はツールチップに残す。
+    private func iconAction(_ icon: [String], _ tooltip: String, _ action: Selector) -> BigButton {
+        // 背を高くしたぶん、パネルに入りきらない画面では縮んでもらう。必須の
+        // ままだと、ウィンドウを小さくしたときにレイアウトが壊れる。
+        let button = BigButton(title: "", height: 118, fontSize: 16, target: self, action: action,
+                               heightPriority: .defaultHigh)
         button.isSecondary = true
+        let image = Lucide.image(icon, size: 40, color: .labelColor, strokeWidth: 1.8)
+        // テンプレートにしておくと、ライト/ダークの切り替えに AppKit が追従する。
+        image?.isTemplate = true
+        button.icon = image
+        button.toolTip = tooltip
         return button
     }
 
@@ -553,20 +591,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // corner where the hand already is.
         let grid = NSStackView()
         grid.orientation = .vertical
-        grid.spacing = 8
+        grid.spacing = 10
         grid.alignment = .leading
         grid.translatesAutoresizingMaskIntoConstraints = false
-        let pairs: [[(String, Selector)]] = [
-            [("元に戻す", #selector(undoStroke(_:))), ("やり直す", #selector(redoStroke(_:)))],
-            [("画像", #selector(openImage(_:))), ("全消去", #selector(clearCanvas(_:)))],
-            [("設定", #selector(openInputSettings(_:))), ("書き出し", #selector(exportPNG(_:)))],
-            [("このページを削除", #selector(deletePage(_:)))],
+        let pairs: [[([String], String, Selector)]] = [
+            [(Lucide.undo, "元に戻す（⌘Z）", #selector(undoStroke(_:))),
+             (Lucide.redo, "やり直す（⇧⌘Z）", #selector(redoStroke(_:)))],
+            [(Lucide.image, "画像を読み込む（⌘O）", #selector(openImage(_:))),
+             (Lucide.download, "PNG で書き出す（⌘S）", #selector(exportPNG(_:)))],
+            [(Lucide.eraser, "すべて消去（⇧⌘K）", #selector(clearCanvas(_:))),
+             (Lucide.trash, "このページを削除", #selector(deletePage(_:)))],
+            [(Lucide.sliders, "設定", #selector(openInputSettings(_:)))],
         ]
         var gridRows: [NSStackView] = []
         for pair in pairs {
-            let row = NSStackView(views: pair.map { actionButton($0.0, $0.1) })
+            let row = NSStackView(views: pair.map { iconAction($0.0, $0.1, $0.2) })
             row.orientation = .horizontal
-            row.spacing = 8
+            row.spacing = 10
             row.distribution = .fillEqually
             grid.addArrangedSubview(row)
             gridRows.append(row)
@@ -665,15 +706,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sendButton.iconAngle = 0
         switch sendState {
         case .ready:
-            // Sending only means something when a session is waiting for it, so
-            // the button is not there the rest of the time.
-            sendButton.isHidden = waitingLabel == nil
-            sendButton.title = waitingLabel.map { "送る → \($0)" } ?? "送る"
-            sendButton.isSecondary = false
-            sendButton.icon = Lucide.image(Lucide.send, size: 24, color: .white)
+            // 送るのは、待っているセッションがあるときだけ意味がある。ただし
+            // 消してしまうと主役の操作が画面から居なくなり、パネルの上半分が
+            // ただの空白になる（操作系が右下へ押し込まれて見える原因）。
+            // 場所は残して、押せないことを見た目で示す。
+            let waiting = waitingLabel
+            sendButton.isHidden = false
+            sendButton.isEnabled = waiting != nil
+            sendButton.isSecondary = waiting == nil
+            sendButton.title = waiting.map { "送る → \($0)" } ?? "送る"
+            sendButton.toolTip = waiting == nil
+                ? "セッションが request_board で待っている間だけ押せます"
+                : "\(waiting!) が待っています"
+            sendButton.icon = Lucide.image(Lucide.send, size: 24,
+                                           color: waiting == nil ? .tertiaryLabelColor : .white)
             sendButton.fill = .hex(0x0CA678)
         case .sending:
             sendButton.isHidden = false
+            sendButton.isEnabled = true
             sendButton.isSecondary = false
             sendButton.title = "送信中"
             sendButton.icon = Lucide.image(Lucide.loaderCircle, size: 24, color: .white, strokeWidth: 2.4)
@@ -685,6 +735,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             spinTimer = spin
         case .sent:
             sendButton.isHidden = false
+            sendButton.isEnabled = true
             sendButton.isSecondary = false
             sendButton.title = "送信済み"
             sendButton.icon = Lucide.image(Lucide.check, size: 26, color: .white, strokeWidth: 2.6)

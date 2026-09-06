@@ -10,6 +10,25 @@ enum Lucide {
     static let clock = ["M12 6v6l4 2"]
     static let terminal = ["m4 17 6-6-6-6", "M12 19h8"]
 
+    // 操作ボタン用。ラベルを外してアイコンだけにするので、意味が一目で
+    // 分かるものを選んである。
+    static let undo = ["M9 14 4 9l5-5", "M4 9h10.5a5.5 5.5 0 0 1 0 11H10"]
+    static let redo = ["m15 14 5-5-5-5", "M20 9H9.5a5.5 5.5 0 0 0 0 11H14"]
+    static let image = ["M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z",
+                        "M11 9a2 2 0 1 1-4 0 2 2 0 0 1 4 0z",
+                        "m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"]
+    static let eraser = ["m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21",
+                         "M22 21H7", "m5 11 9 9"]
+    static let download = ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4",
+                           "m7 10 5 5 5-5", "M12 15V3"]
+    static let trash = ["M3 6h18", "M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6",
+                        "M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2", "M10 11v6", "M14 11v6"]
+    static let sliders = ["M21 4h-7", "M10 4H3", "M21 12h-9", "M8 12H3", "M21 20h-5", "M12 20H3",
+                          "M14 2v4", "M8 10v4", "M16 18v4"]
+    static let pen = ["M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"]
+    static let chevronLeft = ["m15 18-6-6 6-6"]
+    static let chevronRight = ["m9 18 6-6-6-6"]
+
     private static var cache: [String: NSImage] = [:]
 
     static func image(_ paths: [String], size: CGFloat, color: NSColor,
