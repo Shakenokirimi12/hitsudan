@@ -25,7 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
-        controller?.releasePointer()
+        // Page saves are debounced; strokes from the last moment before quitting
+        // (or before the updater relaunches us) would otherwise never be written.
+        controller?.flushPendingSave()
+        controller?.releaseTablet()
     }
 
     // MARK: - Menu bar
@@ -37,6 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         symbol?.isTemplate = true
         item.button?.image = symbol
         let menu = NSMenu()
+        // rebuild() sets isEnabled by hand (the board items only make sense with
+        // the tablet attached). With auto-enabling on, AppKit would overwrite
+        // that with "has a target", and 「ボードを表示」 would open a full-screen
+        // board on the main display with no tablet to ever close it again.
+        menu.autoenablesItems = false
         menu.delegate = self
         item.menu = menu
         statusItem = item
@@ -63,12 +71,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         show.isEnabled = present
         menu.addItem(show)
 
-        let pointerItem = NSMenuItem(title: "ペンでカーソル操作",
-                                     action: #selector(togglePointer(_:)), keyEquivalent: "")
-        pointerItem.target = self
-        pointerItem.state = (controller?.isPointerEnabled ?? false) ? .on : .off
-        pointerItem.isEnabled = present
-        menu.addItem(pointerItem)
+        // The pen display is walled off from the mouse, so what the pen and
+        // the barrier are doing has to be readable from here.
+        for line in controller?.ownershipSummary ?? [] {
+            let row = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            menu.addItem(row)
+        }
+        if controller?.barrierNeedsAccessibility == true {
+            let grant = NSMenuItem(title: "アクセシビリティを許可…",
+                                   action: #selector(openAccessibilitySettings(_:)), keyEquivalent: "")
+            grant.target = self
+            menu.addItem(grant)
+        }
 
         menu.addItem(.separator())
 
@@ -89,7 +104,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let login = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLoginItem(_:)), keyEquivalent: "")
         login.target = self
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            login.state = .on
+        case .requiresApproval:
+            // Registered, but the user has not allowed it in System Settings
+            // yet — neither on nor off. Clicking takes them there.
+            login.title = "ログイン時に起動（承認待ち）"
+            login.state = .mixed
+        default:
+            login.state = .off
+        }
         menu.addItem(login)
 
         let update = NSMenuItem(title: UpdatePrompt.isBusy ? "更新を確認中…" : "アップデートを確認…",
@@ -117,9 +142,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func togglePointer(_ sender: NSMenuItem) {
-        controller?.setPointerEnabled(sender.state != .on)
-        refresh()
+    /// The system prompt is shown once per launch; after that, this is the way in.
+    @objc private func openAccessibilitySettings(_ sender: Any?) {
+        let pane = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        if let url = URL(string: pane) { NSWorkspace.shared.open(url) }
     }
 
     @objc private func toggleWidget(_ sender: NSMenuItem) {
@@ -129,16 +155,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleLoginItem(_ sender: NSMenuItem) {
+        let service = SMAppService.mainApp
+        // Waiting on approval is not something register() can fix; only the
+        // user can, in System Settings.
+        if service.status == .requiresApproval {
+            SMAppService.openSystemSettingsLoginItems()
+            return
+        }
         do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
+            if service.status == .enabled {
+                try service.unregister()
             } else {
-                try SMAppService.mainApp.register()
+                try service.register()
             }
         } catch {
-            NSSound.beep()
+            if service.status == .requiresApproval {
+                SMAppService.openSystemSettingsLoginItems()
+            } else {
+                showLoginItemError(error)
+            }
+            refresh()
+            return
         }
+        // register() can succeed and still leave the item awaiting approval.
+        if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
         refresh()
+    }
+
+    private func showLoginItemError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "「ログイン時に起動」を切り替えられませんでした"
+        alert.informativeText = error.localizedDescription
+        // A menu-bar agent is usually not active, and an inactive app's alert
+        // opens behind whatever is in front.
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 }
 
@@ -154,6 +206,10 @@ private func buildMenu() {
 
     let appItem = NSMenuItem()
     let appMenu = NSMenu()
+    // The panel's settings button disappears with the panel (操作パネルの表示を
+    // 切替), and the pressure curve and display choice live only in that window.
+    appMenu.addItem(item("設定…", #selector(MainWindowController.openInputSettings(_:)), ","))
+    appMenu.addItem(.separator())
     appMenu.addItem(item("ボードを閉じる", #selector(MainWindowController.hideBoard(_:)), "w"))
     appMenu.addItem(item("筆談ボードを隠す", #selector(NSApplication.hide(_:)), "h"))
     appMenu.addItem(.separator())

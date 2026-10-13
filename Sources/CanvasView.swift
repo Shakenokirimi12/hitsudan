@@ -1,8 +1,9 @@
 import AppKit
 
-/// The paper. Position comes from the OS cursor (correct on a display tablet
-/// whatever the screen mapping); pressure, tilt and pen buttons come from
-/// `TabletHID` when it is listening, and fall back to NSEvent tablet data.
+/// The paper. With a pen display assigned, strokes are driven straight from
+/// `TabletHID` samples (see MainWindowController.drivePen); otherwise position
+/// comes from mouse events, with pressure from `TabletHID` when it is
+/// listening and NSEvent tablet data as the fallback.
 final class CanvasView: NSView {
 
     struct Point { var p: CGPoint; var w: CGFloat }
@@ -22,8 +23,9 @@ final class CanvasView: NSView {
     var eraserSelected = false
     var pressureSource: (() -> (pressure: Double, eraser: Bool)?)?
     var onChange: (() -> Void)?
-    /// Set while strokes are driven by absolute tablet coordinates, so the OS
-    /// cursor does not draw a second, wrong stroke alongside the pen.
+    /// Set while strokes are driven by absolute tablet coordinates. If macOS
+    /// is also moving the cursor from the pen (the seize was refused), its
+    /// clicks must not draw a second, wrong stroke alongside the pen.
     var ignoresMouse = false
     /// Draw a shape, then hold still without lifting: the stroke snaps to the
     /// clean version of what you drew, and stays adjustable until you lift.
@@ -59,7 +61,12 @@ final class CanvasView: NSView {
     var preview: CGImage? { didSet { needsDisplay = true } }
 
     private(set) var strokes: [Stroke] = []
-    private var redoStack: [Stroke] = []
+    private enum Redo { case stroke(Stroke), clear }
+    private var redoStack: [Redo] = []
+    /// What each 「すべて消去」 took away, newest last. The clear button is
+    /// tapped with the pen, so it has to be undoable rather than guarded by a
+    /// dialog. Undo reaches one of these once the strokes drawn since are gone.
+    private var clears: [(strokes: [Stroke], background: CGImage?)] = []
     private var live: Stroke?
     private var burned = 0                    // points of `live` already in the bitmap
 
@@ -68,7 +75,15 @@ final class CanvasView: NSView {
     private var strokeStart: CGPoint?
     /// The corner (or end) the snapped shape is pinned to while it is adjusted.
     private var snapAnchor: CGPoint?
+    /// From the pen to the corner it steers. A closed shape's dragged corner is
+    /// a corner of its bounding box, while the pen sits on the outline; using
+    /// the pen position itself would make the shape jump on the next sample.
+    private var snapOffset = CGVector.zero
     private var lastMovement = Date()
+    /// Where the pen was when movement was last registered. Stillness is judged
+    /// against this rather than the previous sample, or slow drawing — a small
+    /// step per sample at 200 Hz — reads as holding still.
+    private var restPoint = CGPoint.zero
     /// How much of the stroke was drawn before the pen settled. The samples
     /// that pile up while holding still are what triggers the snap; they are
     /// not part of the shape and must not be judged as if they were.
@@ -218,9 +233,11 @@ final class CanvasView: NSView {
         burned = 0
         strokeStart = start
         snapAnchor = nil
+        snapOffset = .zero
         snapped = nil
         movedUpTo = 1
         lastMovement = Date()
+        restPoint = start
         startHoldWatch()
         if live!.erase { burnLive() }
         needsDisplay = true
@@ -236,7 +253,8 @@ final class CanvasView: NSView {
         // stroke carries on being appended to the tidied shape.
         if let kind = snapped {
             if let anchor = snapAnchor {
-                live!.points = idealShape(kind, from: anchor, to: point, width: averageWidth())
+                let corner = CGPoint(x: point.x + snapOffset.dx, y: point.y + snapOffset.dy)
+                live!.points = idealShape(kind, from: anchor, to: corner, width: averageWidth())
                 needsDisplay = true
             }
             return
@@ -245,9 +263,13 @@ final class CanvasView: NSView {
         let previous = live!.points.last!
         let next = Point(p: point, w: w)
         live!.points.append(next)
-        if hypot(next.p.x - previous.p.x, next.p.y - previous.p.y) > 2.5 {
+        // Measured from one fixed spot, the whole sway of hand tremor counts,
+        // not just the step between two samples, so the radius has to be wider
+        // than one step or a pen held still keeps reading as moving.
+        if hypot(next.p.x - restPoint.x, next.p.y - restPoint.y) > 4 {
             lastMovement = Date()
             movedUpTo = live!.points.count
+            restPoint = next.p
         }
         if live!.erase { burnLive() }
         setNeedsDisplay(dirtyRect(previous, next))
@@ -258,6 +280,7 @@ final class CanvasView: NSView {
         holdTimer = nil
         strokeStart = nil
         snapAnchor = nil
+        snapOffset = .zero
         snapped = nil
         guard var stroke = live else { return }
         if !stroke.erase { burnLive() }
@@ -503,20 +526,26 @@ final class CanvasView: NSView {
 
     // MARK: - Commands
 
-    var canUndo: Bool { !strokes.isEmpty }
+    var canUndo: Bool { !strokes.isEmpty || !clears.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
 
     /// Drop a stroke still in progress without committing it. Anything that
     /// rewrites the bitmap has to do this first, or the half-finished stroke is
     /// rasterised afterwards on top of the new state.
     func cancelStroke() {
+        // An eraser stroke is burned into the bitmap as it goes, so dropping it
+        // has to take the erasure back out — even when the caller then finds
+        // nothing to do and never rebuilds.
+        let wasBurned = live?.erase == true
         holdTimer?.invalidate()
         holdTimer = nil
         live = nil
         burned = 0
         strokeStart = nil
         snapAnchor = nil
+        snapOffset = .zero
         snapped = nil
+        if wasBurned { rebuildBitmap() }
     }
 
     // MARK: - Shape snapping
@@ -586,10 +615,12 @@ final class CanvasView: NSView {
             return
         }
 
+        // The pen is wherever it settled, which can be past the end of `drawn`.
+        let pen = stroke.points.last!.p
         let anchor: CGPoint, moving: CGPoint
         if kind == .line {
             anchor = start
-            moving = last
+            moving = pen
         } else {
             let xs = points.map(\.x), ys = points.map(\.y)
             let box = CGRect(x: xs.min()!, y: ys.min()!,
@@ -606,6 +637,7 @@ final class CanvasView: NSView {
 
         snapped = kind
         snapAnchor = anchor
+        snapOffset = CGVector(dx: moving.x - pen.x, dy: moving.y - pen.y)
         live!.points = idealShape(kind, from: anchor, to: moving, width: averageWidth())
         needsDisplay = true
         onSnap?(kind == .line ? "直線に補正" : kind == .ellipse ? "円に補正" : "四角に補正")
@@ -679,41 +711,84 @@ final class CanvasView: NSView {
 
     func undo() {
         cancelStroke()
-        guard let last = strokes.popLast() else { return }
-        redoStack.append(last)
+        if let last = strokes.popLast() {
+            redoStack.append(.stroke(last))
+        } else if let cleared = clears.popLast() {
+            strokes = cleared.strokes
+            // An underlay put down since the clear is not on the undo stack, so
+            // replacing it would lose it for good; it wins over the cleared one.
+            if backgroundImage == nil { backgroundImage = cleared.background }
+            redoStack.append(.clear)
+        } else {
+            return
+        }
         rebuildBitmap()
         onChange?()
     }
 
     func redo() {
         cancelStroke()
-        guard let stroke = redoStack.popLast() else { return }
-        strokes.append(stroke)
+        guard let next = redoStack.popLast() else { return }
+        switch next {
+        case .stroke(let stroke): strokes.append(stroke)
+        case .clear: wipe()
+        }
         rebuildBitmap()
         onChange?()
     }
 
     func clearAll() {
         cancelStroke()
-        strokes.removeAll()
-        redoStack.removeAll()
-        backgroundImage = nil
+        // Clearing a blank sheet would leave an undo step that changes nothing.
+        if !isEmpty {
+            redoStack.removeAll()
+            wipe()
+        }
         rebuildBitmap()
         onChange?()
     }
 
+    private func wipe() {
+        clears.append((strokes, backgroundImage))
+        strokes.removeAll()
+        backgroundImage = nil
+    }
+
+    /// Clears ink a session's accepted proposal replaces. Not undoable, so an
+    /// older 「すべて消去」 must not resurface over what was just applied.
     func clearInkOnly() {
         cancelStroke()
         strokes.removeAll()
         redoStack.removeAll()
+        clears.removeAll()
         rebuildBitmap()
         onChange?()
     }
 
     func setBackground(_ image: CGImage?) {
-        backgroundImage = image
+        backgroundImage = image.map(fittedToSheet)
         needsDisplay = true
         onChange?()
+    }
+
+    /// The underlay is never drawn larger than the sheet's bitmap, so pixels
+    /// beyond that only cost memory and PNG encoding on every page save.
+    private func fittedToSheet(_ image: CGImage) -> CGImage {
+        let k = min(Self.paperSize.width * bitmapScale / CGFloat(image.width),
+                    Self.paperSize.height * bitmapScale / CGFloat(image.height))
+        guard k < 1 else { return image }
+        let w = max(Int((CGFloat(image.width) * k).rounded()), 1)
+        let h = max(Int((CGFloat(image.height) * k).rounded()), 1)
+        // Keep the source's colour space (screenshots are often Display P3);
+        // fall back to sRGB for ones a bitmap context cannot draw into.
+        let space = image.colorSpace.flatMap { $0.model == .rgb ? $0 : nil }
+            ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return image }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage() ?? image
     }
 
     var isEmpty: Bool { strokes.isEmpty && backgroundImage == nil }
@@ -735,6 +810,7 @@ final class CanvasView: NSView {
     func restore(strokes stored: [StoredStroke], background image: CGImage?) {
         cancelStroke()
         redoStack.removeAll()
+        clears.removeAll()
         strokes = stored.map { s in
             Stroke(color: NSColor(srgbRed: CGFloat(s.r), green: CGFloat(s.g),
                                   blue: CGFloat(s.b), alpha: CGFloat(s.a)),
@@ -742,8 +818,9 @@ final class CanvasView: NSView {
                    points: s.points.map { Point(p: CGPoint(x: $0.x, y: $0.y), w: CGFloat($0.w)) })
         }
         backgroundImage = image
-        notice = nil
-        preview = nil
+        // notice and preview are left alone: a pending proposal or a session's
+        // request belongs to the board, not to the page, and must survive a
+        // page turn. Their owner (MainWindowController) clears them.
         rebuildBitmap()
     }
 

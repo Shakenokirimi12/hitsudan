@@ -60,14 +60,17 @@ final class TabletHID {
     private(set) var lastOpenStatus: IOReturn = kIOReturnNotOpen
 
     private var manager: IOHIDManager?
-    private var buffers: [UnsafeMutablePointer<UInt8>] = []
+    /// Each attached interface and the buffer IOKit writes its reports into.
+    /// The device is kept so the buffer can be detached from it before freeing.
+    private var buffers: [(device: IOHIDDevice, buffer: UnsafeMutablePointer<UInt8>, size: Int)] = []
     private var retryTimer: Timer?
     private var didRequestAccess = false
 
     /// Take the device exclusively. macOS otherwise keeps driving the cursor
-    /// from the same reports we are reading, and the two event streams fight —
-    /// interleaved presses and releases, strokes cut in half. Seizing needs no
-    /// root, only the Input Monitoring grant we already hold.
+    /// from the same reports we are reading, and the pen display is meant to
+    /// be the board's alone: the pen would click whatever the cursor lands on
+    /// as well as the board. Seizing needs no root, only the Input Monitoring
+    /// grant we already hold.
     private(set) var isSeizing = false
 
     /// True when reports can actually be read: the device matched and the
@@ -92,12 +95,14 @@ final class TabletHID {
 
     func start() {
         openManager()
+        reportOpenFailure()
         // Input Monitoring normally only takes effect on relaunch. Re-opening on
         // a timer means granting it while the app runs is enough.
         let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
             guard let self, self.lastOpenStatus != kIOReturnSuccess else { return }
             self.teardown()
             self.openManager()
+            self.reportOpenFailure()
         }
         RunLoop.main.add(timer, forMode: .common)
         retryTimer = timer
@@ -120,15 +125,30 @@ final class TabletHID {
 
     private func teardown() {
         guard let mgr = manager else { return }
+        // Detach every buffer from its device first, by hand rather than
+        // trusting the manager to reach devices it may already have dropped
+        // (a removed interface). After this nothing can write into them.
+        for entry in buffers {
+            IOHIDDeviceRegisterInputReportCallback(entry.device, entry.buffer, entry.size, nil, nil)
+            IOHIDDeviceUnscheduleFromRunLoop(entry.device, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        }
         IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
         IOHIDManagerClose(mgr, IOOptionBits(isSeizing ? kIOHIDOptionsTypeSeizeDevice : kIOHIDOptionsTypeNone))
         manager = nil
         isConnected = false
+        // Each open attaches every interface afresh, and without this every
+        // seize toggle, replug and 3-second retry would leave its buffers behind.
+        buffers.forEach { $0.buffer.deallocate() }
+        buffers.removeAll()
     }
 
     /// Re-open with a different exclusivity. Safe to call at any time.
-    func setSeizing(_ seize: Bool) {
-        guard seize != isSeizing else { return }
+    /// Returns whether the requested exclusivity is what we ended up with —
+    /// the seize can fail and fall back, and the caller must not carry on as
+    /// if it held the device.
+    @discardableResult
+    func setSeizing(_ seize: Bool) -> Bool {
+        guard seize != isSeizing else { return true }
         isSeizing = seize
         teardown()
         openManager()
@@ -137,8 +157,19 @@ final class TabletHID {
             isSeizing = false
             teardown()
             openManager()
-            onStatus?("排他確保に失敗したため通常モードに戻しました")
         }
+        // Only the final outcome is reported: the failed seize in between is
+        // not news if the fallback opened, and announcing it would make the
+        // receiver judge presence while the fallback is still attaching.
+        reportOpenFailure()
+        return isSeizing == seize
+    }
+
+    /// Never synchronous: the receiver evaluates presence, which can stand down
+    /// and re-enter `setSeizing` while the caller is still in the middle of it.
+    private func reportOpenFailure() {
+        guard lastOpenStatus != kIOReturnSuccess else { return }
+        notifyLater("HIDを開けません — \(diagnostics)")
     }
 
     private func openManager() {
@@ -171,16 +202,13 @@ final class TabletHID {
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
         let options = IOOptionBits(isSeizing ? kIOHIDOptionsTypeSeizeDevice : kIOHIDOptionsTypeNone)
         lastOpenStatus = IOHIDManagerOpen(mgr, options)
-        if lastOpenStatus != kIOReturnSuccess {
-            onStatus?("HIDを開けません — \(diagnostics)")
-        }
     }
 
     private func attach(_ device: IOHIDDevice) {
         let size = max((IOHIDDeviceGetProperty(device, kIOHIDMaxInputReportSizeKey as CFString) as? NSNumber)?.intValue ?? 64, 64)
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: size)
         buf.initialize(repeating: 0, count: size)
-        buffers.append(buf)
+        buffers.append((device, buf, size))
 
         IOHIDDeviceRegisterInputReportCallback(device, buf, size, { ctx, _, _, _, reportID, report, length in
             guard let ctx else { return }
@@ -189,8 +217,8 @@ final class TabletHID {
         }, Unmanaged.passUnretained(self).toOpaque())
         // commonModes, not defaultMode: AppKit runs a tracking loop while a
         // button is held or a menu is open, and in defaultMode the pen would go
-        // silent for exactly as long as the press lasts — no release event, and
-        // the watchdog yanking the cursor back mid-click.
+        // silent for exactly as long as the press lasts — the button pressed
+        // by the pen would never get its mouse-up.
         IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
 
         if !isConnected {
@@ -211,6 +239,12 @@ final class TabletHID {
         switch (reportID, length) {
         case (0x08, 14...):
             let flags = bytes[1]
+            // The same report ID also carries the pad: 0xE0 express keys, 0xF0
+            // the touch strip, 0xF1 the dial (as Linux's hid-uclogic reads
+            // them). A pen frame only ever sets bits 0-3 and 7, so anything in
+            // bits 4-6 is not the pen — taken as one, a key press would move
+            // the cursor to whatever its payload spells as coordinates.
+            guard flags & 0x70 == 0 else { return }
             s.mode = .vendor
             s.inRange = flags & 0x80 != 0
             s.tip = flags & 0x01 != 0

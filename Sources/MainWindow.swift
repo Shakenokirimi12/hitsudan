@@ -101,6 +101,7 @@ final class BigButton: NSButton {
         }
 
         let color: NSColor = isSecondary ? .labelColor : .white
+        let textColor = isEnabled ? color : color.withAlphaComponent(0.4)
         // 収まらないぶんは末尾を省略する。これが無いと、送り先が付いて
         // 「送る → <セッション名>」になったときに自然幅のまま描かれ、
         // アイコンが左へはみ出してテキストが端で切れていた。
@@ -109,7 +110,7 @@ final class BigButton: NSButton {
         style.lineBreakMode = .byTruncatingTail
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font ?? NSFont.systemFont(ofSize: 17, weight: .semibold),
-            .foregroundColor: isEnabled ? color : color.withAlphaComponent(0.4),
+            .foregroundColor: textColor,
             .paragraphStyle: style,
         ]
         let padding: CGFloat = 12
@@ -118,7 +119,9 @@ final class BigButton: NSButton {
 
         // アイコンだけのボタン（title が空）は、中央にアイコンを置いて終わり。
         guard !title.isEmpty else {
-            if let icon { drawIcon(icon, centredAt: CGPoint(x: bounds.midX, y: bounds.midY)) }
+            if let icon {
+                drawIcon(icon, centredAt: CGPoint(x: bounds.midX, y: bounds.midY), textColor: textColor)
+            }
             return
         }
 
@@ -137,7 +140,8 @@ final class BigButton: NSButton {
         let total = icon.size.width + gap + textWidth
         let originX = max(bounds.midX - total / 2, padding)
 
-        drawIcon(icon, centredAt: CGPoint(x: originX + icon.size.width / 2, y: bounds.midY))
+        drawIcon(icon, centredAt: CGPoint(x: originX + icon.size.width / 2, y: bounds.midY),
+                 textColor: textColor)
 
         let leftAligned = NSMutableParagraphStyle()
         leftAligned.alignment = .left
@@ -150,14 +154,33 @@ final class BigButton: NSButton {
                                  withAttributes: textAttrs)
     }
 
-    private func drawIcon(_ icon: NSImage, centredAt centre: CGPoint) {
+    /// `draw(in:)` ignores `isTemplate`, so a template icon is painted here:
+    /// the mask goes into a transparency layer and the tint is filled
+    /// `.sourceIn` over it. The tint is resolved now, against the appearance
+    /// AppKit set up for this draw, so a light/dark switch (which redraws the
+    /// view) repaints the icon in the new colour. `.sourceIn` keeps the tint's
+    /// own alpha, so a translucent colour such as `.tertiaryLabelColor` stays
+    /// translucent instead of being blended with the black mask.
+    ///
+    /// A disabled button paints its icon in the dimmed text colour: on an
+    /// icon-only button (page arrows) that is the only cue it does nothing.
+    private func drawIcon(_ icon: NSImage, centredAt centre: CGPoint, textColor: NSColor) {
         NSGraphicsContext.saveGraphicsState()
         let transform = NSAffineTransform()
         transform.translateX(by: centre.x, yBy: centre.y)
         transform.rotate(byRadians: iconAngle)
         transform.translateX(by: -icon.size.width / 2, yBy: -icon.size.height / 2)
         transform.concat()
-        icon.draw(in: NSRect(origin: .zero, size: icon.size))
+        let rect = NSRect(origin: .zero, size: icon.size)
+        if icon.isTemplate, let context = NSGraphicsContext.current?.cgContext {
+            context.beginTransparencyLayer(auxiliaryInfo: nil)
+            icon.draw(in: rect)
+            (isEnabled ? (icon as? LucideIcon)?.tint ?? textColor : textColor).setFill()
+            rect.fill(using: .sourceIn)
+            context.endTransparencyLayer()
+        } else {
+            icon.draw(in: rect)
+        }
         NSGraphicsContext.restoreGraphicsState()
     }
 }
@@ -171,13 +194,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private let canvas = CanvasView()
     private let hid = TabletHID()
-    private let pointer = PenPointer()
+    private let barrier = MouseBarrier()
     private let bridge = BoardBridge()
 
     private let telemetry = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private var sendButton: BigButton!
-    private var clearButton: BigButton!
     private var applyButton: BigButton!
     private var discardButton: BigButton!
     private let proposalLabel = NSTextField(labelWithString: "")
@@ -198,6 +220,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         /// Content from a session is rarely about the page in hand, so accepting
         /// it starts a fresh page instead of burying what is already there.
         let onNewPage: Bool
+        /// Shown faintly over the sheet while undecided. Each proposal sets its
+        /// own, so a text or clear proposal never shows an earlier one's SVG.
+        var preview: CGImage?
+        /// Session key that made it, and whether its outcome is filed for that session.
+        var owner = ""
+        var notify = false
+        /// The page retention it asked for, applied only when it is accepted.
+        var retain: Retention?
         let apply: () -> Void
     }
     private var proposal: Proposal?
@@ -207,8 +237,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// The page a request pulled up, and where to go back to afterwards.
     private var scratchPageID: String?
     private var returnToPage: Int?
+    /// Which session the scratch page was made for. Another session's request
+    /// never inherits it — and so can never get it deleted.
+    private var scratchOwner = ""
     private var readingClearWork: DispatchWorkItem?
-    private var pendingScratchDrop: String?
+    /// A scratch page whose fate is being asked about ("残しますか？"). The
+    /// question owns it: only an explicit 破棄 on that question deletes it.
+    private var pendingScratchDrop: (id: String, back: Int?)?
     /// What the pen was before a session borrowed it, and what the session set
     /// it to — so it can be handed back untouched, and only if the person has
     /// not since chosen something else themselves.
@@ -221,15 +256,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let inputs = InputMap()
     private var modeControl: NSSegmentedControl!
     private var pressedKeys: Set<UInt8> = []
+    /// Keys we posted a key-down for, so each gets exactly one key-up — even if
+    /// the seize changed, or the device went away, while it was held.
+    private var postedKeys: Set<UInt8> = []
     private var previousPenButtons = (false, false, false)
     private var previousStripButton = false
     private var stripCarry = 0.0
+    /// The settings, as a sheet on the board or a window on another display.
     private var settingsSheet: NSWindow?
+    private var settingsCloseObserver: NSObjectProtocol?
 
     private let pages = PageStore()
     private var prevPageButton: BigButton!
     private var nextPageButton: BigButton!
-    private var newPageButton: BigButton!
     private let pageLabel = NSTextField(labelWithString: "")
     private var saveWork: DispatchWorkItem?
     private var eraserHeldFrom: Bool?
@@ -238,23 +277,42 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var cleanMode = false
     /// Which session, if any, is sitting in wait_for_board right now.
     private var waitingLabel: String?
+    /// Its file key (see hitsudan-mcp's sessionKey); "" from servers that predate it.
+    private var waitingKey = ""
+    private var waitingPrompt = ""
     private var waitingUntil = Date.distantPast
 
     private let widgetStack = NSStackView()
     private var widgets: [WidgetView] = []
     private let displayPopup = NSPopUpButton()
-    private let pointerBox = NSButton()
     private let shapeBox = NSButton()
     private let curvePopup = NSPopUpButton()
     private let widthDial = DialControl()
     private var swatches: [SwatchView] = []
 
     private var lastSampleAt = Date.distantPast
-    private var answerText = ""
     private var isPresent = false
     private var penScreen: NSScreen?
     private var penIsDown = false
-    private var screenChoices: [NSScreen?] = []
+    /// A press that landed on a control rather than on the paper. It owns the
+    /// pen until the nib lifts, so dragging off the button onto the paper does
+    /// not turn into ink, and the control gets its matching mouse-up.
+    private var controlPress: (window: NSWindow, at: CGPoint)?
+    private var controlPressNumber = 0
+    /// Where the pen last pointed, in screen coordinates.
+    private var lastPenPoint: CGPoint?
+    /// The pen display menu, by identity: "auto" or a display's UUID.
+    /// Positions shift whenever a display comes or goes.
+    private var screenChoices: [(id: String, screen: NSScreen?)] = []
+    private var penDisplayChoice = UserDefaults.standard.string(forKey: "penDisplay") ?? "auto"
+    /// The seize was asked for and refused while this tablet has been present.
+    /// Not retried on every presence check: each attempt reopens the device,
+    /// which would cut into whatever is being drawn.
+    private var seizeRefused = false
+    /// When the pen display went missing (system uptime, so a clock change
+    /// cannot stretch it), for the grace before giving up the seize.
+    private var penScreenLostAt: TimeInterval?
+    private var lastBarrierState = MouseBarrier.State.off
     var onPresenceChange: ((Bool) -> Void)?
 
     /// Gamma applied to raw pressure. Below 1 gives light strokes more width.
@@ -267,7 +325,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Construction
 
     private var isFullScreen = false
-    private var hideAfterExitingFullScreen = false
+    /// True from our own toggleFullScreen (or windowWill…FullScreen for one we
+    /// did not start) until windowDid…FullScreen. Another toggleFullScreen
+    /// during the animation is ignored by AppKit, and `isFullScreen` still
+    /// describes the state being left.
+    private var isChangingFullScreen = false
+    /// Bumped by each toggle we start; `toggleStarted` turns true once AppKit
+    /// confirms it with windowWill…FullScreen.
+    private var toggleGeneration = 0
+    private var toggleStarted = true
+    /// What to do once the transition in flight settles. Unplugging and
+    /// re-plugging can land mid-animation; the latest request wins.
+    private enum AfterFullScreenChange { case nothing, hide, show }
+    private var afterFullScreenChange = AfterFullScreenChange.nothing
 
     init() {
         let window = BoardWindow(
@@ -280,6 +350,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         window.center()
         super.init(window: window)
         window.delegate = self
+        // Settings from when the pen could drive the system cursor. "follow"
+        // mapped the pen onto whichever display the cursor was on, which means
+        // nothing now that the pen never moves it.
+        if penDisplayChoice == "follow" {
+            penDisplayChoice = "auto"
+            UserDefaults.standard.set(penDisplayChoice, forKey: "penDisplay")
+        }
+        UserDefaults.standard.removeObject(forKey: "pointerEnabled")
         buildUI()
         wireUp()
         installEscapeHatch()
@@ -290,25 +368,116 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func installEscapeHatch() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53 else { return event }   // esc
+            // The monitor sees every window's keys. Esc in the settings sheet or
+            // in a confirmation alert belongs to that window, not to the board.
+            guard let self, let board = self.window, event.window === board, board.isKeyWindow,
+                  board.attachedSheet == nil, NSApp.modalWindow == nil else { return event }
             // Escape backs out one step at a time: panels first, board second.
-            if self?.cleanMode == true {
-                self?.toggleCleanMode(nil)
+            // A panel held up by a pending question is already showing, so
+            // that step is skipped rather than silently turning clean mode off.
+            if self.panelView?.isHidden == true {
+                self.toggleCleanMode(nil)
             } else {
-                self?.hideBoard(nil)
+                self.hideBoard(nil)
             }
             return nil
         }
     }
 
-    func windowDidEnterFullScreen(_ notification: Notification) { isFullScreen = true }
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        isChangingFullScreen = true
+        toggleStarted = true
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        isChangingFullScreen = false
+        isFullScreen = true
+        settleFullScreenChange()
+    }
+
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+        isChangingFullScreen = false
+        settleFullScreenChange()
+    }
+
+    func windowWillExitFullScreen(_ notification: Notification) {
+        isChangingFullScreen = true
+        toggleStarted = true
+    }
 
     func windowDidExitFullScreen(_ notification: Notification) {
+        isChangingFullScreen = false
         isFullScreen = false
-        if hideAfterExitingFullScreen {
-            hideAfterExitingFullScreen = false
-            window?.orderOut(nil)
+        settleFullScreenChange()
+    }
+
+    func windowDidFailToExitFullScreen(_ window: NSWindow) {
+        isChangingFullScreen = false
+        // Asking to leave again could fail again, round and round. A queued
+        // hide (usually the tablet going away) must still happen, so put the
+        // window away as it is rather than leave it filling the main display.
+        if afterFullScreenChange == .hide {
+            afterFullScreenChange = .nothing
+            window.orderOut(nil)
             NSApp.setActivationPolicy(.accessory)
+            return
         }
+        settleFullScreenChange()
+    }
+
+    /// Mark the transition as under way from the moment we ask for it, not from
+    /// windowWill…FullScreen: a comeForward landing in between would otherwise
+    /// see a settled full screen, drop the queued hide and leave the board
+    /// windowed once the exit finishes.
+    private func startFullScreenToggle() {
+        guard let window else { return }
+        toggleGeneration += 1
+        let generation = toggleGeneration
+        toggleStarted = false
+        isChangingFullScreen = true
+        window.toggleFullScreen(nil)
+        // A toggle AppKit declines arrives at no delegate method at all, and a
+        // flag that never clears would queue every later show and hide for
+        // good. Treat silence as the matching failure.
+        // Generous: windowWill… normally follows within a frame or two, and a
+        // late one after this fires is still handled by the delegate methods.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, self.toggleGeneration == generation, !self.toggleStarted,
+                  self.isChangingFullScreen, let window = self.window else { return }
+            NSLog("hitsudan: toggleFullScreen was not taken up; settling as a failed transition")
+            if self.isFullScreen {
+                self.windowDidFailToExitFullScreen(window)
+            } else {
+                self.windowDidFailToEnterFullScreen(window)
+            }
+        }
+    }
+
+    /// Carry out whatever was asked for while the window was mid-animation.
+    /// Only requests made through hideBoard/comeForward are queued, so leaving
+    /// full screen by hand (green button, ⌃⌘F) is left alone.
+    private func settleFullScreenChange() {
+        let next = afterFullScreenChange
+        afterFullScreenChange = .nothing
+        switch next {
+        case .nothing: break
+        case .hide: hideBoard(nil)
+        case .show: comeForward()
+        }
+    }
+
+    /// Keep the side widgets live only while someone can see them. The
+    /// sessions widget spawns `claude agents` to refresh, which is pointless
+    /// work for an agent that sits in the menu bar all day with the board away.
+    private func refreshVisibleWidgets() {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible) else { return }
+        for w in widgets where !w.isHidden { w.refresh() }
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        // Coming back into view should not show a clock that is up to a
+        // second stale.
+        refreshVisibleWidgets()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -316,8 +485,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return false
     }
 
-    /// Leaving full screen is animated, so the window can only be ordered out
-    /// once that has finished — hence the flag.
     /// Sharing a screen in a call means the sheet is the only thing worth
     /// showing — the panels are for working, not for an audience.
     @objc func toggleCleanMode(_ sender: Any?) {
@@ -327,14 +494,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func setCleanMode(_ on: Bool) {
         cleanMode = on
-        panelView?.isHidden = on
-        statusLabel.stringValue = on ? "" : "操作パネルを表示しました"
+        applyPanelVisibility()
+        statusLabel.stringValue = on && panelView?.isHidden == false
+            ? "依頼が済むと操作パネルを隠します" : (on ? "" : "操作パネルを表示しました")
     }
 
+    /// The panel holds 適用/破棄/送る, the only way a pen can answer. While a
+    /// proposal or a request is up it is shown whatever clean mode says; the
+    /// saved preference is left alone and takes over again once nothing is pending.
+    private func applyPanelVisibility() {
+        panelView?.isHidden = cleanMode && proposal == nil && waitingLabel == nil
+    }
+
+    /// Leaving full screen is animated, so the window can only be ordered out
+    /// once that has finished — settleFullScreenChange does it from there.
     @objc func hideBoard(_ sender: Any?) {
-        if isFullScreen {
-            hideAfterExitingFullScreen = true
-            window?.toggleFullScreen(nil)
+        if isChangingFullScreen {
+            // A toggle now would be dropped; hide once the animation lands.
+            afterFullScreenChange = .hide
+        } else if isFullScreen {
+            afterFullScreenChange = .hide
+            startFullScreenToggle()
         } else {
             window?.orderOut(nil)
             NSApp.setActivationPolicy(.accessory)
@@ -363,14 +543,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         displayPopup.toolTip = "ペンの絶対座標を割り当てるディスプレイ"
         displayPopup.widthAnchor.constraint(equalToConstant: 280).isActive = true
 
-        pointerBox.setButtonType(.switch)
-        pointerBox.title = "カーソル操作"
-        pointerBox.controlSize = .large
-        pointerBox.font = NSFont.systemFont(ofSize: 14)
-        pointerBox.target = self
-        pointerBox.action = #selector(pointerToggled(_:))
-        pointerBox.toolTip = "ペンでシステム全体のカーソルとクリックを動かします"
-
         shapeBox.setButtonType(.switch)
         shapeBox.title = "図形補正"
         shapeBox.state = .on
@@ -380,7 +552,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         shapeBox.action = #selector(shapeSnapToggled(_:))
         shapeBox.toolTip = "描いたあと、離さずに止めると直線・円・四角に整形します"
 
-        // ディスプレイ割当・カーソル操作・図形補正・ペンの生データは、常時見えて
+        // ディスプレイ割当・図形補正・ペンの生データは、常時見えて
         // いる必要がない。画面下の帯をまるごと設定ウィンドウへ移してある
         // （openInputSettings が組み立てる）。ここでは中身の設定だけ済ませる。
 
@@ -423,29 +595,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         ])
     }
 
-    private func iconButton(_ symbol: String, _ tooltip: String, _ action: Selector) -> NSButton {
-        let b = NSButton()
-        let config = NSImage.SymbolConfiguration(pointSize: 20, weight: .regular)
-        b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)?
-            .withSymbolConfiguration(config)
-        b.bezelStyle = .texturedRounded
-        b.imagePosition = .imageOnly
-        b.controlSize = .large
-        b.toolTip = tooltip
-        b.target = self
-        b.action = action
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.widthAnchor.constraint(equalToConstant: 54).isActive = true
-        b.heightAnchor.constraint(equalToConstant: 44).isActive = true
-        return b
-    }
-
     private func pageButton(_ icon: [String], _ tooltip: String, _ action: Selector) -> BigButton {
         let button = BigButton(title: "", height: 48, fontSize: 20, target: self, action: action)
         button.isSecondary = true
-        let image = Lucide.image(icon, size: 22, color: .labelColor, strokeWidth: 2)
-        image?.isTemplate = true
-        button.icon = image
+        button.icon = Lucide.image(icon, size: 22, color: .labelColor, strokeWidth: 2)
         button.toolTip = tooltip
         button.widthAnchor.constraint(equalToConstant: 62).isActive = true
         return button
@@ -456,8 +609,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // 速く、バーの横幅も空く。名前はツールチップに残す。
         let penIcon = Lucide.image(Lucide.pen, size: 22, color: .labelColor, strokeWidth: 1.8)
         let eraserIcon = Lucide.image(Lucide.eraser, size: 22, color: .labelColor, strokeWidth: 1.8)
-        penIcon?.isTemplate = true
-        eraserIcon?.isTemplate = true
         let mode: NSSegmentedControl
         if let penIcon, let eraserIcon {
             mode = NSSegmentedControl(images: [penIcon, eraserIcon], trackingMode: .selectOne,
@@ -544,10 +695,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let button = BigButton(title: "", height: 118, fontSize: 16, target: self, action: action,
                                heightPriority: .defaultHigh)
         button.isSecondary = true
-        let image = Lucide.image(icon, size: 40, color: .labelColor, strokeWidth: 1.8)
-        // テンプレートにしておくと、ライト/ダークの切り替えに AppKit が追従する。
-        image?.isTemplate = true
-        button.icon = image
+        // Lucide.image はテンプレート（形だけのマスク）を返し、色は BigButton が
+        // 描くたびにその時の外観で解決して塗る。ライト/ダークの切り替えにも追従する。
+        button.icon = Lucide.image(icon, size: 40, color: .labelColor, strokeWidth: 1.8)
         button.toolTip = tooltip
         return button
     }
@@ -595,7 +745,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
              (Lucide.redo, "やり直す（⇧⌘Z）", #selector(redoStroke(_:)))],
             [(Lucide.image, "画像を読み込む（⌘O）", #selector(openImage(_:))),
              (Lucide.download, "PNG で書き出す（⌘S）", #selector(exportPNG(_:)))],
-            [(Lucide.eraser, "すべて消去（⇧⌘K）", #selector(clearCanvas(_:))),
+            [(Lucide.brushCleaning, "すべて消去（⇧⌘K）", #selector(clearCanvas(_:))),
              (Lucide.trash, "このページを削除", #selector(deletePage(_:)))],
             [(Lucide.sliders, "設定", #selector(openInputSettings(_:)))],
         ]
@@ -641,43 +791,92 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     /// Once the answer is sent, decide what happens to the page it was drawn on.
-    private func settleScratchPage(_ how: Retention) {
+    /// `false` when a page that was to be thrown away could not be.
+    @discardableResult
+    private func settleScratchPage(_ how: Retention) -> Bool {
         retention = .keep
-        guard let scratch = scratchPageID else { return }
+        guard let scratch = scratchPageID else { return true }
+        let back = returnToPage
+        // The page leaves the request here either way, so a request arriving
+        // while "残しますか？" is still up starts a page of its own.
+        forgetScratchPage()
         switch how {
         case .keep:
-            scratchPageID = nil
-            returnToPage = nil
+            break
         case .temporary:
-            dropScratchPage()
+            return dropScratchPage(scratch, returningTo: back)
         case .ask:
             propose("この下書きページを残しますか？", onNewPage: false,
                     applyTitle: "残す", discardTitle: "破棄") { [weak self] in
-                self?.scratchPageID = nil
-                self?.returnToPage = nil
+                self?.pendingScratchDrop = nil
             }
             // Discarding the proposal is what throws the page away.
-            pendingScratchDrop = scratch
+            pendingScratchDrop = (scratch, back)
         }
+        return true
     }
 
-    private func dropScratchPage() {
-        guard let scratch = scratchPageID else { return }
-        let back = returnToPage
+    /// Stop treating the scratch page as disposable. The page itself stays.
+    private func forgetScratchPage() {
         scratchPageID = nil
         returnToPage = nil
-        pages.delete(scratch)
-        openPage(back.map { min($0, pages.count - 1) } ?? pages.current)
+        scratchOwner = ""
+    }
+
+    /// `false` when the page could not be deleted and was left in place.
+    @discardableResult
+    private func dropScratchPage(_ scratch: String, returningTo back: Int?) -> Bool {
+        // The person may have moved on to another page since; what is on it
+        // must not be lost to the reload below.
+        savePage()
+        let wasOn = pages.currentID
+        guard pages.delete(scratch) else {
+            // The page is still there, so it stays where the person is and
+            // becomes an ordinary page; the caller has already let go of it.
+            statusLabel.stringValue = "一時ボードを削除できませんでした（ページは残っています）"
+            return false
+        }
+        if wasOn == scratch {
+            openPage(back.map { min($0, pages.count - 1) } ?? pages.current)
+        } else if let wasOn, let index = pages.order.firstIndex(of: wasOn) {
+            pages.go(to: index)
+            refreshPageBar()
+        }
         statusLabel.stringValue = "一時ボードを片付けました"
+        return true
+    }
+
+    /// The band across the top belongs to the board, not to a page: it shows
+    /// what is being asked of the person right now, so turning a page or
+    /// settling one thing never makes another request vanish. With nothing
+    /// pending it is empty: a proposal's line is not kept after 適用, since
+    /// nothing would ever take it down again and it would sit over every page.
+    private func refreshNotice() {
+        if let proposal {
+            canvas.notice = proposal.summary
+        } else if let waitingLabel {
+            canvas.notice = waitingPrompt.isEmpty ? "\(waitingLabel) が手書きを待っています" : waitingPrompt
+        } else {
+            canvas.notice = nil
+        }
     }
 
     private func clearWaiting() {
         guard waitingLabel != nil else { return }
         waitingLabel = nil
+        waitingKey = ""
+        waitingPrompt = ""
         waitingUntil = .distantPast
-        canvas.notice = nil
-        returnBorrowedPen()
+        // The page retention was that request's. Left in place, a later
+        // proposal that names none would inherit, say, .temporary, and its page
+        // could be thrown away by an unrelated send. 送る reads it before
+        // getting here.
+        retention = .keep
+        refreshNotice()
+        // A proposal still up may have borrowed it too; endProposal hands it back.
+        if proposal == nil { returnBorrowedPen() }
         applySendState()
+        applyPanelVisibility()
     }
 
     private func currentInkIndex() -> Int {
@@ -746,32 +945,81 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// matches what is on the sheet.
     private func schedulePageSave() {
         saveWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.savePage() }
+        let work = DispatchWorkItem { [weak self] in
+            self?.saveWork = nil
+            self?.savePage()
+        }
         saveWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
     }
+
+    /// Write out a save that is still waiting on the debounce — on quit, the
+    /// last strokes are otherwise lost with it.
+    func flushPendingSave() {
+        guard let work = saveWork else { return }
+        work.cancel()
+        saveWork = nil
+        savePage()
+    }
+
+    /// The underlay as it was last read from or written to disk. Encoding a
+    /// full-size PNG on the main thread is far too slow to repeat on every
+    /// stroke, so it is only done when the underlay itself has changed.
+    private var storedUnderlay: (page: String, image: CGImage?)?
 
     private func savePage() {
         guard let id = pages.currentID else { return }
         var page = pages.load(id) ?? PageData(id: id, created: Date(), updated: Date(),
                                               strokes: [], background: nil)
         page.strokes = canvas.storedStrokes
-        if let background = canvas.backgroundImage,
-           let png = NSBitmapImageRep(cgImage: background).representation(using: .png, properties: [:]) {
-            page.background = pages.storeBackground(png, for: id)
+        var failed = false
+        let background = canvas.backgroundImage
+        let unchanged = storedUnderlay.map { $0.page == id && $0.image === background } ?? false
+        if unchanged {
+            // Still restate the name, in case the page file it came with could
+            // not be read and is being replaced.
+            page.background = background == nil ? nil : (page.background ?? "\(id).png")
+        } else if let background {
+            if let png = NSBitmapImageRep(cgImage: background).representation(using: .png, properties: [:]),
+               let name = pages.storeBackground(png, for: id) {
+                page.background = name
+            } else {
+                failed = true
+            }
         } else {
             page.background = nil
         }
-        pages.save(page)
+        if pages.save(page) {
+            // Only once the page no longer points at the old underlay file is
+            // it safe to drop it, or to stop retrying a write that failed.
+            if !unchanged, !failed {
+                if background == nil { pages.removeBackground(for: id) }
+                storedUnderlay = (id, background)
+            }
+        } else {
+            failed = true
+        }
+        if failed { statusLabel.stringValue = "ページを保存できませんでした" }
     }
 
     private func openPage(_ index: Int) {
         saveWork?.cancel()
+        saveWork = nil
         pages.go(to: index)
-        guard let id = pages.currentID, let page = pages.load(id) else { return }
-        canvas.restore(strokes: page.strokes,
-                       background: page.background.flatMap { pages.background(named: $0) })
+        guard let id = pages.currentID else { return }
+        // A page that cannot be read still has to replace what is on the
+        // sheet: the sheet now stands for this page, and the next save would
+        // otherwise copy the previous page's strokes into it.
+        let page = pages.load(id)
+        let background = page?.background.flatMap { pages.background(named: $0) }
+        canvas.restore(strokes: page?.strokes ?? [], background: background)
+        storedUnderlay = (id, canvas.backgroundImage)
         refreshPageBar()
+        if page == nil {
+            // After the caller's own "ページ N" line, which would hide it.
+            let note = "ページ \(pages.current + 1) を読み込めませんでした"
+            DispatchQueue.main.async { [weak self] in self?.statusLabel.stringValue = note }
+        }
     }
 
     /// The outgoing sheet swings away on its spine while the new one is already
@@ -881,7 +1129,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
         saveWork?.cancel()
-        pages.delete(id)
+        saveWork = nil
+        guard pages.delete(id) else {
+            // The page stays, so what was drawn on it in the last moment must too.
+            savePage()
+            statusLabel.stringValue = "ページを削除できませんでした"
+            return
+        }
         openPage(pages.current)
         statusLabel.stringValue = "ページを削除しました（残り \(pages.count)）"
     }
@@ -893,8 +1147,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         var removed = 0
         for id in pages.order where id != keep {
             guard let page = pages.load(id) else { continue }
-            if page.strokes.isEmpty && page.background == nil {
-                pages.delete(id)
+            if page.strokes.isEmpty && page.background == nil, pages.delete(id) {
                 removed += 1
             }
         }
@@ -971,8 +1224,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case .thicker, .thinner:
             widthDial.doubleValue += action == .thicker ? 2 : -2
             applyWidth()
-        case .rightClick: inputs.click(.right)
-        case .middleClick: inputs.click(.center)
+        case .rightClick: penClick(.right)
+        case .middleClick: penClick(.center)
         case .toggleLaser: setLaser(!canvas.laserMode)
         case .passthrough, .none, .eraseWhileHeld, .laserWhileHeld: break
         case .color1, .color2, .color3, .color4, .color5: break   // handled above
@@ -1020,7 +1273,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         stack.addArrangedSubview(sectionHeading("動作"))
         stack.addArrangedSubview(labelled("ペンの割当先", displayPopup))
         stack.addArrangedSubview(labelled("筆圧カーブ", curvePopup))
-        stack.addArrangedSubview(pointerBox)
         stack.addArrangedSubview(shapeBox)
         stack.addArrangedSubview(labelled("ペンの生データ", telemetry))
 
@@ -1080,11 +1332,36 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
         ])
 
-        let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 200),
-                             styleMask: [.titled], backing: .buffered, defer: false)
-        sheet.contentView = content
-        settingsSheet = sheet
-        host.beginSheet(sheet)
+        // The mouse is walled off the pen display, and a pop-up's menu runs its
+        // own tracking loop that the pen's posted clicks are not known to reach.
+        // A sheet on the board could leave a menu open that nothing can close,
+        // so the settings go on a display the mouse can reach whenever there is one.
+        let elsewhere = NSScreen.screens.first { $0 != penScreen && $0 == NSScreen.main }
+            ?? NSScreen.screens.first { $0 != penScreen }
+        guard penScreen != nil, let elsewhere else {
+            let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 200),
+                                 styleMask: [.titled], backing: .buffered, defer: false)
+            sheet.contentView = content
+            settingsSheet = sheet
+            host.beginSheet(sheet)
+            return
+        }
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 200),
+                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        panel.title = "設定"
+        panel.isReleasedWhenClosed = false
+        panel.contentView = content
+        panel.layoutIfNeeded()
+        let visible = elsewhere.visibleFrame
+        panel.setFrameOrigin(NSPoint(x: visible.midX - panel.frame.width / 2,
+                                     y: max(visible.minY, visible.midY - panel.frame.height / 2)))
+        settingsSheet = panel
+        settingsCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: panel, queue: .main) { [weak self] _ in
+            self?.forgetSettingsWindow()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
     }
 
     @objc private func assignmentChanged(_ sender: NSPopUpButton) {
@@ -1115,7 +1392,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func closeInputSettings(_ sender: Any?) {
         guard let sheet = settingsSheet else { return }
-        window?.endSheet(sheet)
+        if sheet.sheetParent != nil {
+            window?.endSheet(sheet)
+            settingsSheet = nil
+        } else {
+            // Cleared here rather than in willClose: a reopen queued right after
+            // this would otherwise find the old window still recorded and give up.
+            forgetSettingsWindow()
+            sheet.close()
+        }
+    }
+
+    private func forgetSettingsWindow() {
+        if let observer = settingsCloseObserver { NotificationCenter.default.removeObserver(observer) }
+        settingsCloseObserver = nil
         settingsSheet = nil
     }
 
@@ -1153,15 +1443,90 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func evaluatePresence() {
         let present = hid.isReadable
-        guard present != isPresent else { return }
-        isPresent = present
-        if present { comeForward() } else { standDown() }
-        onPresenceChange?(present)
+        if present != isPresent {
+            isPresent = present
+            if present { comeForward() } else { standDown() }
+            onPresenceChange?(present)
+        }
+        // Also on every periodic check: the barrier picks up an Accessibility
+        // grant this way, and follows the tablet's HID coming and going.
+        updatePenOwnership()
     }
+
+    /// The pen display is the board's alone. While there is a tablet and a
+    /// display to map it onto, the device is seized, so macOS never moves the
+    /// cursor from the pen, and the mouse is walled off that display. Without
+    /// a display the pen has nowhere to go but the OS's own handling, so both
+    /// are let go and the cursor follows the pen as it would with no app.
+    private func updatePenOwnership() {
+        // A display reconfiguring (wake, a resolution change) can drop out
+        // for a moment. Every change of seize reopens the device, so the seize
+        // is only given up once the display has stayed gone for a beat; the
+        // periodic presence check comes back to it.
+        let displayGone = penScreen == nil
+            && ProcessInfo.processInfo.systemUptime - (penScreenLostAt ?? 0) >= 1.5
+        if isPresent, penScreen != nil, !hid.isSeizing, !seizeRefused {
+            if !hid.setSeizing(true) {
+                seizeRefused = true
+                statusLabel.stringValue = "タブレットを排他確保できませんでした — macOS がペンでカーソルを動かします"
+            }
+        } else if !isPresent || displayGone, hid.isSeizing {
+            hid.setSeizing(false)
+        }
+
+        // While macOS reads the pen itself (the seize refused, or the HID not
+        // ours to read), its cursor is the pen's, and walling the display off
+        // would throw the pen's own cursor back out. `isPresent` covers the
+        // moment a refused seize is still reattaching unseized. Unplugged,
+        // there is no pen to collide with, and the display stays the board's.
+        let osDrivesPen = (hid.isConnected || isPresent) && !hid.isSeizing
+        barrier.update(blocking: osDrivesPen ? nil : penScreen?.displayID)
+        if barrier.state != lastBarrierState {
+            let previous = lastBarrierState
+            lastBarrierState = barrier.state
+            // A barrier that simply works is reported in the menu bar; the
+            // board only hears about one that needs something, and about that
+            // being resolved, so a stale complaint does not linger there.
+            switch barrier.state {
+            case .off: break
+            case .active:
+                if previous != .off { statusLabel.stringValue = barrier.summary }
+            case .needsAccessibility, .unavailable:
+                statusLabel.stringValue = barrier.summary
+            }
+        }
+    }
+
+    /// One line each for the menu bar, where it can be read even with the
+    /// board away (and with the mouse unable to reach the pen display).
+    var ownershipSummary: [String] {
+        let pen: String
+        if !hid.isConnected {
+            pen = "ペン 未接続"
+        } else if hid.isSeizing {
+            pen = "ペン ボード専用（\(penScreen?.localizedName ?? "")）"
+        } else if penScreen == nil {
+            pen = "ペン 割当先ディスプレイなし（macOS がカーソルを動かします）"
+        } else if isPresent {
+            pen = "ペン 排他確保できず（macOS がカーソルを動かします）"
+        } else {
+            pen = "ペン HID を読めません（macOS がカーソルを動かします）"
+        }
+        return [pen, barrier.summary]
+    }
+
+    var barrierNeedsAccessibility: Bool { barrier.state == .needsAccessibility }
 
     func comeForward() {
         rebuildDisplayChoices()
-        hideAfterExitingFullScreen = false
+        if isChangingFullScreen {
+            // Typically a re-plug while the unplug's exit animation is still
+            // running: `isFullScreen` is still true, so carrying on would skip
+            // re-entering and leave the board windowed. Come back once it lands.
+            afterFullScreenChange = .show
+            return
+        }
+        afterFullScreenChange = .nothing
         let target = penScreen ?? NSScreen.main ?? NSScreen.screens.first
         // Full screen needs a regular app, and it lands on whichever display the
         // window is already on — so place it first, then let the run loop settle
@@ -1176,16 +1541,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         guard !isFullScreen else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            guard let self, !self.isFullScreen, self.window?.isVisible == true else { return }
-            self.window?.toggleFullScreen(nil)
+            guard let self, !self.isFullScreen, !self.isChangingFullScreen,
+                  self.window?.isVisible == true else { return }
+            self.startFullScreenToggle()
         }
     }
 
     func standDown() {
-        pointer.surrender()
-        pointer.isEnabled = false
-        pointerBox.state = .off
+        releaseControlPress()
+        seizeRefused = false
         hid.setSeizing(false)
+        releaseHeldInputs()
         canvas.ignoresMouse = false
         hideBoard(nil)
     }
@@ -1193,14 +1559,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Settings
 
     private enum Key {
-        static let pointer = "pointerEnabled"
         static let curve = "curveIndex"
         static let width = "baseWidth"
     }
 
     private func saveSettings() {
         let d = UserDefaults.standard
-        d.set(pointerBox.state == .on, forKey: Key.pointer)
         d.set(curvePopup.indexOfSelectedItem, forKey: Key.curve)
         d.set(widthDial.doubleValue, forKey: Key.width)
     }
@@ -1216,13 +1580,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             let w = d.double(forKey: Key.width)
             if w > 0 { widthDial.doubleValue = w; canvas.baseWidth = CGFloat(w) }
         }
-        // Cursor takeover is the point of the app, so it is on unless turned off.
         setCleanMode(d.bool(forKey: "cleanMode"))
-        let wantsPointer = d.object(forKey: Key.pointer) == nil ? true : d.bool(forKey: Key.pointer)
-        if wantsPointer, penScreen != nil {
-            pointerBox.state = .on
-            pointerToggled(pointerBox)
-        }
     }
 
     // MARK: - Wiring
@@ -1263,8 +1621,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         hid.onSample = { [weak self] s in
             guard let self else { return }
             self.lastSampleAt = Date()
-            self.pointer.screen = self.penScreen
-            self.pointer.handle(s)
 
             if self.canvas.laserMode {
                 // Same trigger as drawing: the spot appears where the nib
@@ -1281,12 +1637,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
             let buttons = [s.tip ? "先" : "・", s.button1 ? "1" : "・",
                            s.button2 ? "2" : "・", s.button3 ? "3" : "・"].joined()
-            let target = self.pointer.isEnabled ? "カーソル操作" : (self.penScreen == nil ? "カーソル追従" : "絶対座標")
+            let target = self.penScreen == nil ? "OS任せ" : (self.hid.isSeizing ? "ボード専用" : "絶対座標")
             self.telemetry.stringValue = String(
                 format: "%@ · %@  筆圧 %5d/16383 (%3.0f%%)  ボタン %@",
                 s.mode.rawValue, target, s.rawPressure, s.pressure * 100, buttons)
         }
-        pointer.mapsRightButton = false   // routed through the assignments instead
 
         hid.onKeys = { [weak self] modifiers, down in
             guard let self else { return }
@@ -1296,19 +1651,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 let action = self.inputs.action(for: id)
                 self.lastInputNote = "key.\(String(format: "%02x", usage))→\(action.rawValue)"
                 if action == .passthrough {
-                    self.inputs.passThrough(usage: usage, modifiers: modifiers, down: true)
+                    // Unseized, macOS already delivers the key itself; posting
+                    // it as well would type it twice.
+                    if self.hid.isSeizing {
+                        self.inputs.passThrough(usage: usage, modifiers: modifiers, down: true)
+                        self.postedKeys.insert(usage)
+                    }
                 } else {
                     self.run(action, down: true)
                 }
             }
             for usage in self.pressedKeys.subtracting(down) {
-                let id = String(format: "key.%02x", usage)
-                let action = self.inputs.action(for: id)
-                if action == .passthrough {
-                    self.inputs.passThrough(usage: usage, modifiers: modifiers, down: false)
-                } else if action.isMomentary {
-                    self.run(action, down: false)
-                }
+                self.keyReleased(usage, modifiers: modifiers)
             }
             self.pressedKeys = down
         }
@@ -1334,7 +1688,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         let watchdog = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            for w in self.widgets where !w.isHidden { w.refresh() }
+            self.refreshVisibleWidgets()
             if self.waitingLabel != nil, Date() > self.waitingUntil { self.clearWaiting() }
             guard Date().timeIntervalSince(self.lastSampleAt) > 2.5 else { return }
             if self.canvas.ignoresMouse {
@@ -1342,7 +1696,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self.canvas.finishStroke()
                 self.penIsDown = false
             }
-            self.pointer.surrender()
+            // The feed stopped mid-tap; the control must still get its mouse-up.
+            self.releaseControlPress()
             if !self.hid.isReadable {
                 self.telemetry.stringValue = "生HID未受信 — \(self.hid.diagnostics)"
             }
@@ -1359,8 +1714,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 age > 60 ? "最終サンプル=なし" : String(format: "最終サンプル=%.1f秒前", age),
                 "モード=\(self.hid.latest.mode.rawValue)",
                 "割当=\(self.penScreen?.localizedName ?? "なし")",
-                "カーソル操作=\(self.pointer.isEnabled ? "ON" : "OFF")",
-                "アクセシビリティ=\(self.pointer.isTrusted ? "許可" : "未許可")",
+                "排他=\(self.hid.isSeizing ? "確保" : (self.seizeRefused ? "失敗" : "なし"))",
+                "マウス制限=\(self.barrier.summary)",
+                "アクセシビリティ=\(AXIsProcessTrusted() ? "許可" : "未許可")",
                 "前面=\(self.isPresent ? "表示" : "常駐")",
                 "待機=\(self.waitingLabel ?? "なし")",
                 "最後の入力=\(self.lastInputNote)",
@@ -1373,12 +1729,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                             atomically: true, encoding: .utf8)
             self.bridge.publish(state: [
                 "waitingFor": self.waitingLabel ?? "",
+                "waitingKey": self.waitingKey,
                 "proposalID": self.lastProposalID,
                 "proposalOutcome": self.lastProposalOutcome,
                 "tabletPresent": self.isPresent,
                 "strokes": self.canvas.strokeCount,
                 "hasBackground": self.canvas.backgroundImage != nil,
-                "pointerEnabled": self.pointer.isEnabled,
+                "penSeized": self.hid.isSeizing,
+                "mouseBarrier": self.barrier.summary,
             ])
             self.evaluatePresence()
         }
@@ -1397,24 +1755,49 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         switch op {
         case "capture":
             guard let png = canvas.flattenedPNG() else { return ["ok": false, "error": "書き出せません"] }
-            bridge.publish(png: png, note: "capture", bump: false)
+            guard bridge.publish(png: png, note: "capture", bump: false) else {
+                return ["ok": false, "error": "ボードの画像を保存できませんでした（~/.hitsudan に書き込めません）"]
+            }
             showReading((args["label"] as? String) ?? waitingLabel ?? "Claude")
             return ["ok": true]
 
         case "clear":
-            propose("セッションがボードの消去を求めています", onNewPage: false) { [weak self] in
+            let owner = (args["key"] as? String) ?? ""
+            let id = propose("セッションがボードの消去を求めています", onNewPage: false,
+                             owner: owner, notify: !owner.isEmpty) { [weak self] in
                 self?.canvas.clearAll()
-                self?.canvas.notice = nil
             }
-            return ["ok": true, "pending": true]
+            return ["ok": true, "pending": true, "proposalID": id, "tabletPresent": isPresent]
 
         case "focus":
-            comeForward()
-            NSApp.activate(ignoringOtherApps: true)
-            return ["ok": true]
+            // Only onto a tablet. Without one this would throw a full-screen
+            // board over whatever the person is doing on the main display.
+            if isPresent { comeForward() }
+            return ["ok": true, "tabletPresent": isPresent]
 
         case "wait":
+            let key = (args["key"] as? String) ?? ""
+            let label = (args["label"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "セッション"
+            // One request at a time. The same session re-posting (wait_for_board
+            // is re-called about once a minute) refreshes its own; anyone else is
+            // turned away instead of silently replacing it, so 送る can never go
+            // to someone other than the session whose prompt is showing. Servers
+            // without a key are told apart by label, as before.
+            let again = waitingLabel != nil && waitingKey == key && (!key.isEmpty || waitingLabel == label)
+            if let current = waitingLabel, !again {
+                return ["ok": false, "busy": true,
+                        "error": "ボードには \(current) の依頼が出ています。そちらが回収されるか期限が切れてから、もう一度依頼してください。"]
+            }
+            // A re-post may change what happens to the page, so it is applied
+            // every time, as before.
             retention = Retention(rawValue: (args["retain"] as? String) ?? "") ?? .keep
+            // A scratch page is reused only by the session it was made for, and
+            // only while it is the page in front of the person; otherwise a send
+            // could delete a page the answer was never drawn on. A re-post of
+            // the request it was made for keeps it even if the page was turned.
+            if !again, scratchPageID != nil, scratchOwner != key || scratchPageID != pages.currentID {
+                forgetScratchPage()
+            }
             if retention != .keep, scratchPageID == nil {
                 // Answer on a page of its own, so a throwaway reply never lands
                 // in the middle of whatever the notebook was being used for.
@@ -1423,28 +1806,35 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 pages.appendPage()
                 openPage(pages.count - 1)
                 scratchPageID = pages.currentID
+                scratchOwner = key
             }
-            waitingLabel = (args["label"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "セッション"
+            waitingLabel = label
+            waitingKey = key
+            waitingPrompt = (args["prompt"] as? String) ?? ""
             // Each poll refreshes the lease, so a session that gives up quietly
             // stops being announced instead of waiting for ever.
             waitingUntil = Date().addingTimeInterval((args["lease"] as? Double) ?? 150)
-            let prompt = (args["prompt"] as? String) ?? ""
-            canvas.notice = prompt.isEmpty ? "\(waitingLabel!) が手書きを待っています" : prompt
-            comeForward()
-            NSApp.activate(ignoringOtherApps: true)
+            refreshNotice()
+            applyPanelVisibility()
+            // Brought forward once per request, not on every re-post — that
+            // would steal focus once a minute. With no tablet the request just
+            // waits; presence brings the board up when one is plugged in.
+            if !again, isPresent { comeForward() }
             applySendState()
-            return ["ok": true]
+            return ["ok": true, "tabletPresent": isPresent]
 
         case "wait_end":
-            clearWaiting()
-            return ["ok": true]
-
-        case "notice":
-            canvas.notice = args["text"] as? String
+            // Only the session whose request is up may take it down: one
+            // session collecting must never clear another's pending request.
+            if waitingKey == ((args["key"] as? String) ?? "") { clearWaiting() }
             return ["ok": true]
 
         case "show":
-            if let r = Retention(rawValue: (args["retain"] as? String) ?? "") { retention = r }
+            let owner = (args["key"] as? String) ?? ""
+            // Every session proposal files its outcome, so the session can learn
+            // it later (board_status) even if it did not wait for it.
+            let notify = !owner.isEmpty
+            let keepAs = Retention(rawValue: (args["retain"] as? String) ?? "")
             var underlay: CGImage?
             if let svg = args["svg"] as? String {
                 let tmp = FileManager.default.temporaryDirectory
@@ -1463,27 +1853,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             } else if let text = args["text"] as? String {
                 let clearInk = args["clear_ink"] as? Bool == true
                 let note = args["notice"] as? String
-                let id = propose(args["notice"] as? String ?? "セッションがテキストを送ってきました") { [weak self] in
+                let id = propose(note ?? "セッションがテキストを送ってきました",
+                                 owner: owner, notify: notify, retain: keepAs) { [weak self] in
                     guard let self else { return }
                     if clearInk { self.canvas.clearInkOnly() }
                     self.canvas.setBackgroundText(text)
-                    self.canvas.notice = note
                 }
-                return ["ok": true, "pending": true, "proposalID": id]
+                return ["ok": true, "pending": true, "proposalID": id, "tabletPresent": isPresent]
             } else {
                 return ["ok": false, "error": "svg / image_path / text のいずれかが必要です"]
             }
             guard let underlay else { return ["ok": false, "error": "描画に失敗しました"] }
             let clearInk = args["clear_ink"] as? Bool == true
             let note = args["notice"] as? String
-            canvas.preview = underlay
-            let id = propose(note ?? "セッションが下敷きを送ってきました") { [weak self] in
+            let id = propose(note ?? "セッションが下敷きを送ってきました", preview: underlay,
+                             owner: owner, notify: notify, retain: keepAs) { [weak self] in
                 guard let self else { return }
                 if clearInk { self.canvas.clearInkOnly() }
                 self.canvas.setBackground(underlay)
-                self.canvas.notice = note
             }
-            return ["ok": true, "pending": true, "proposalID": id]
+            return ["ok": true, "pending": true, "proposalID": id, "tabletPresent": isPresent]
 
         case "set_pen":
             // Only while something has actually been asked of the person. The
@@ -1526,13 +1915,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return [
                 "ok": true,
                 "waitingFor": waitingLabel ?? "",
+                "waitingKey": waitingKey,
                 "proposalID": lastProposalID,
                 "proposalOutcome": lastProposalOutcome,
                 "pendingProposal": proposal != nil,
                 "tabletPresent": isPresent,
                 "strokes": canvas.strokeCount,
                 "hasBackground": canvas.backgroundImage != nil,
-                "pointerEnabled": pointer.isEnabled,
+                "penSeized": hid.isSeizing,
+                "mouseBarrier": barrier.summary,
             ]
 
         default:
@@ -1543,21 +1934,32 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// A session never overwrites the sheet on its own: it offers, and the
     /// person decides with a button big enough to hit with a pen.
     @discardableResult
-    private func propose(_ summary: String, onNewPage: Bool = true,
+    private func propose(_ summary: String, onNewPage: Bool = true, preview: CGImage? = nil,
+                         owner: String = "", notify: Bool = false, retain: Retention? = nil,
                          applyTitle: String = "適用", discardTitle: String = "破棄",
                          _ apply: @escaping () -> Void) -> String {
+        // Never replace a question silently. Whoever asked the old one hears it
+        // was withdrawn, and an unanswered "残しますか？" leaves its page alone:
+        // deleting a page takes an explicit 破棄 on that very question.
+        if let old = proposal {
+            if old.notify { bridge.publishOutcome(proposal: old.id, outcome: "superseded") }
+            pendingScratchDrop = nil
+        }
         let id = UUID().uuidString
         proposal = Proposal(id: id, summary: summary, applyTitle: applyTitle,
-                            discardTitle: discardTitle, onNewPage: onNewPage, apply: apply)
+                            discardTitle: discardTitle, onNewPage: onNewPage, preview: preview,
+                            owner: owner, notify: notify, retain: retain, apply: apply)
         applyButton.title = applyTitle
         discardButton.title = discardTitle
         lastProposalID = id
         lastProposalOutcome = "pending"
         proposalLabel.stringValue = summary
         for v in [proposalLabel, applyButton, discardButton] as [NSView] { v.isHidden = false }
-        canvas.notice = summary
-        comeForward()
-        NSApp.activate(ignoringOtherApps: true)
+        canvas.preview = preview
+        refreshNotice()
+        applyPanelVisibility()
+        // As with requests: brought forward only where there is a tablet.
+        if isPresent { comeForward() }
         return id
     }
 
@@ -1566,39 +1968,53 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if waitingLabel == nil { returnBorrowedPen() }
         canvas.preview = nil
         for v in [proposalLabel, applyButton, discardButton] as [NSView] { v.isHidden = true }
+        refreshNotice()
+        applyPanelVisibility()
     }
 
     @objc private func applyProposal(_ sender: Any?) {
         guard let proposal else { return }
         canvas.preview = nil
+        // What becomes of the new page. It becomes the pending answer's
+        // retention only while this session's own request is up: another
+        // session's request has its own, and with none up there is no answer
+        // for it to govern — kept, it would only leak into a later proposal.
+        let keepAs = proposal.retain ?? retention
+        if waitingLabel != nil, waitingKey == proposal.owner { retention = keepAs }
         if proposal.onNewPage {
             savePage()
             let from = pages.current
             pages.appendPage()
             openPage(pages.count - 1)
-            if retention != .keep, scratchPageID == nil { returnToPage = from }
+            if keepAs != .keep, scratchPageID == nil { returnToPage = from }
         }
         proposal.apply()
-        pendingScratchDrop = nil
-        if proposal.onNewPage, retention != .keep, scratchPageID == nil {
+        if proposal.onNewPage, keepAs != .keep, scratchPageID == nil {
             scratchPageID = pages.currentID
+            scratchOwner = proposal.owner
         }
         lastProposalOutcome = "applied"
+        let filed = !proposal.notify || bridge.publishOutcome(proposal: proposal.id, outcome: "applied")
         endProposal()
-        statusLabel.stringValue = proposal.onNewPage
-            ? "新しいページ \(pages.current + 1) に適用しました" : "適用しました"
+        statusLabel.stringValue = (proposal.onNewPage
+            ? "新しいページ \(pages.current + 1) に適用しました" : "適用しました")
+            + (filed ? "" : "（結果をセッションに伝えられませんでした）")
     }
 
     @objc private func discardProposal(_ sender: Any?) {
-        canvas.notice = nil
+        guard let proposal else { return }
         lastProposalOutcome = "rejected"
+        let filed = !proposal.notify || bridge.publishOutcome(proposal: proposal.id, outcome: "rejected")
+        // Set only while the "残しますか？" question is the proposal on screen.
+        let drop = pendingScratchDrop
+        pendingScratchDrop = nil
         endProposal()
-        if pendingScratchDrop != nil {
-            pendingScratchDrop = nil
-            dropScratchPage()
+        if let drop {
+            dropScratchPage(drop.id, returningTo: drop.back)
+            if !filed { statusLabel.stringValue += "（結果をセッションに伝えられませんでした）" }
             return
         }
-        statusLabel.stringValue = "破棄しました"
+        statusLabel.stringValue = filed ? "破棄しました" : "破棄しました（結果をセッションに伝えられませんでした）"
     }
 
     /// Rasterise at sheet resolution — an SVG's natural size is usually tiny.
@@ -1671,7 +2087,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func undoStroke(_ sender: Any?) { canvas.undo() }
     @objc func redoStroke(_ sender: Any?) { canvas.redo() }
-    @objc func clearCanvas(_ sender: Any?) { canvas.clearAll() }
+    @objc func clearCanvas(_ sender: Any?) {
+        let hadContent = !canvas.isEmpty
+        canvas.clearAll()
+        if hadContent { statusLabel.stringValue = "すべて消去しました（⌘Z で元に戻せます）" }
+    }
 
     @objc func openImage(_ sender: Any?) {
         let panel = NSOpenPanel()
@@ -1698,7 +2118,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func send(_ sender: Any?) {
         guard sendState != .sending else { return }
-        guard waitingLabel != nil else {
+        guard let recipient = waitingLabel else {
             statusLabel.stringValue = "待っているセッションがありません"
             return
         }
@@ -1706,6 +2126,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             statusLabel.stringValue = "キャンバスが空です"
             return
         }
+        // Who it goes to is decided by what the person saw when they pressed
+        // 送る. Commands are drained between here and the hop below, so the
+        // waiting state may have changed by then (lease ran out, another
+        // session's request went up).
+        let key = waitingKey
+        let howToKeep = retention
+        let sentFrom = pages.currentID
         sendState = .sending
         statusLabel.stringValue = "書き出しています…"
         canvas.notice = nil
@@ -1717,13 +2144,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard let png = self.canvas.flattenedPNG() else {
                 self.sendState = .ready
                 self.statusLabel.stringValue = "画像を書き出せません"
+                self.refreshNotice()
                 return
             }
-            let recipient = self.waitingLabel
-            let howToKeep = self.retention
-            self.bridge.publish(png: png, note: recipient ?? "送る", bump: true)
-            self.clearWaiting()
-            self.settleScratchPage(howToKeep)
+            // Addressed to that session and kept until it collects — a
+            // read_board in between cannot overwrite it. Even if its lease ran
+            // out during the hop, its collect_board looks for a reply first.
+            guard self.bridge.publishReply(png: png, key: key, label: recipient) else {
+                // Nothing reached the session, so the request, its page and
+                // the button stay as they were for another try.
+                self.sendState = .ready
+                self.statusLabel.stringValue = "送信できませんでした（~/.hitsudan に書き込めません）"
+                self.refreshNotice()
+                return
+            }
+            if self.waitingLabel != nil, self.waitingKey == key { self.clearWaiting() }
+            // Only the page the answer was drawn on is the request's to throw
+            // away or ask about; a scratch page the person moved off is kept.
+            var scratchKept = false
+            if self.scratchPageID != nil, self.scratchPageID == sentFrom {
+                scratchKept = !self.settleScratchPage(howToKeep)
+            } else if self.scratchOwner == key {
+                self.forgetScratchPage()
+                self.retention = .keep
+            }
+            self.refreshNotice()
             // Also on the clipboard, for a session with no MCP server.
             let pb = NSPasteboard.general
             pb.clearContents()
@@ -1732,8 +2177,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             // Hold the spinner long enough to be read as a state, not a flicker.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 self.sendState = .sent
-                self.statusLabel.stringValue = recipient.map { "\($0) へ送信しました" }
-                    ?? "クリップボードにコピーしました（セッションで ⌘V）"
+                // The status line is overwritten here, so a page that could
+                // not be thrown away has to be said again or it goes unnoticed.
+                self.statusLabel.stringValue = "\(recipient) へ送信しました"
+                    + (scratchKept ? "（一時ボードは削除できず残っています）" : "")
             }
         }
     }
@@ -1741,19 +2188,35 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Absolute pen mapping
 
     private func rebuildDisplayChoices() {
-        let previous = displayPopup.indexOfSelectedItem
         displayPopup.removeAllItems()
         screenChoices = []
         displayPopup.addItem(withTitle: "ペン割当: 自動")
-        screenChoices.append(nil)
+        screenChoices.append(("auto", nil))
         for screen in NSScreen.screens {
             displayPopup.addItem(withTitle: "ペン割当: \(screen.localizedName)")
-            screenChoices.append(screen)
+            screenChoices.append((Self.displayIdentity(screen), screen))
         }
-        displayPopup.addItem(withTitle: "ペン割当: カーソル追従")
-        screenChoices.append(nil)
-        displayPopup.selectItem(at: (previous >= 0 && previous < displayPopup.numberOfItems) ? previous : 0)
+        // A chosen display that is unplugged stays chosen, so the pen goes
+        // back to it when it returns instead of to whatever took its place.
+        if penDisplayChoice != "auto",
+           !screenChoices.contains(where: { $0.id == penDisplayChoice }) {
+            let name = UserDefaults.standard.string(forKey: "penDisplayName") ?? "ディスプレイ"
+            displayPopup.addItem(withTitle: "ペン割当: \(name)（未接続）")
+            screenChoices.append((penDisplayChoice, nil))
+        }
+        displayPopup.selectItem(at: screenChoices.firstIndex { $0.id == penDisplayChoice } ?? 0)
         resolvePenScreen()
+    }
+
+    /// Stable across replugging and rearranging: the display's UUID, or its
+    /// name where the system has no UUID to give.
+    private static func displayIdentity(_ screen: NSScreen) -> String {
+        if let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+           let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue(),
+           let text = CFUUIDCreateString(nil, uuid) {
+            return text as String
+        }
+        return "name:\(screen.localizedName)"
     }
 
     private func detectTabletScreen() -> NSScreen? {
@@ -1764,53 +2227,47 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func resolvePenScreen() {
-        let index = displayPopup.indexOfSelectedItem
-        if index == 0 {
+        switch penDisplayChoice {
+        case "auto":
             penScreen = detectTabletScreen()
             displayPopup.item(at: 0)?.title = penScreen.map { "ペン割当: 自動（\($0.localizedName)）" }
                 ?? "ペン割当: 自動（未検出）"
-        } else if index == displayPopup.numberOfItems - 1 {
-            penScreen = nil
-        } else if index < screenChoices.count {
-            penScreen = screenChoices[index]
+        default:
+            penScreen = screenChoices.first { $0.id == penDisplayChoice }?.screen
         }
-        if penScreen == nil, canvas.ignoresMouse {
-            canvas.ignoresMouse = false
-            canvas.finishStroke()
-            penIsDown = false
+        if penScreen == nil {
+            if penScreenLostAt == nil { penScreenLostAt = ProcessInfo.processInfo.systemUptime }
+            lastPenPoint = nil
+            if canvas.ignoresMouse {
+                canvas.ignoresMouse = false
+                canvas.finishStroke()
+                penIsDown = false
+            }
+            // drivePen no longer runs without a display; nothing else would
+            // ever release a control pressed when it went.
+            releaseControlPress()
+        } else {
+            penScreenLostAt = nil
         }
+        updatePenOwnership()
     }
 
-    @objc private func displayChoiceChanged(_ sender: NSPopUpButton) { resolvePenScreen() }
+    @objc private func displayChoiceChanged(_ sender: NSPopUpButton) {
+        let index = sender.indexOfSelectedItem
+        guard screenChoices.indices.contains(index) else { return }
+        penDisplayChoice = screenChoices[index].id
+        UserDefaults.standard.set(penDisplayChoice, forKey: "penDisplay")
+        if let screen = screenChoices[index].screen {
+            UserDefaults.standard.set(screen.localizedName, forKey: "penDisplayName")
+        }
+        // A deliberate choice is worth another try at the seize.
+        seizeRefused = false
+        resolvePenScreen()
+    }
 
     @objc private func shapeSnapToggled(_ sender: NSButton) {
         canvas.snapsShapes = sender.state == .on
         UserDefaults.standard.set(canvas.snapsShapes, forKey: "shapeSnap")
-    }
-
-    @objc private func pointerToggled(_ sender: NSButton) {
-        guard sender.state == .on else {
-            pointer.isEnabled = false
-            hid.setSeizing(false)
-            saveSettings()
-            statusLabel.stringValue = "カーソル操作を停止しました"
-            return
-        }
-        guard penScreen != nil else {
-            sender.state = .off
-            statusLabel.stringValue = "先に「ペン割当」でディスプレイを選んでください"
-            return
-        }
-        if !pointer.isTrusted {
-            pointer.requestTrust()
-            sender.state = .off
-            statusLabel.stringValue = "アクセシビリティを許可してから、もう一度チェックしてください"
-            return
-        }
-        hid.setSeizing(true)
-        pointer.isEnabled = true
-        saveSettings()
-        statusLabel.stringValue = "ペンでカーソル操作中"
     }
 
     /// Where this sample lands on the sheet, in paper coordinates.
@@ -1823,21 +2280,63 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func drivePen(with s: PenSample) {
-        // Even with the pointer driver running, strokes come from the raw feed
-        // rather than from our own synthesized mouse events: macOS coalesces
-        // dragged events, so a 200 Hz pen arrives back as a few dozen scattered
-        // points. Drawing from the samples keeps every one of them.
+        // Strokes come from the raw feed, never from mouse events: macOS
+        // coalesces dragged events, so a 200 Hz pen would arrive as a few
+        // dozen scattered points. Drawing from the samples keeps every one.
         guard let screen = penScreen, let window = self.window else { return }
-        canvas.ignoresMouse = true
         let frame = screen.frame
         let screenPoint = CGPoint(x: frame.minX + s.x * frame.width,
                                   y: frame.maxY - s.y * frame.height)
+        // Out of range there is nowhere the pen points; a right-click from a
+        // key must not land wherever the pen happened to leave.
+        lastPenPoint = s.inRange ? screenPoint : nil
+
+        if let press = controlPress {
+            if s.tip {
+                controlPress = (press.window, screenPoint)
+                postMouse(.leftMouseDragged, at: screenPoint, to: press.window)
+            } else {
+                releaseControlPress()
+                penIsDown = false
+            }
+            return
+        }
+
+        // The samples arrive whether or not the board can be seen. A hidden
+        // board, or one under a sheet or an alert, must not take ink — the pen
+        // is busy with something else, and the stroke would be saved and sent.
+        let boardIsUsable = window.isVisible && window.attachedSheet == nil && NSApp.modalWindow == nil
+        guard boardIsUsable else {
+            if penIsDown { canvas.finishStroke() }
+            // The sheet or alert in front is ours too, and only the pen can
+            // reach it on this display.
+            let pressed = s.tip && !penIsDown
+            // A press still held when the board comes back belongs to whatever
+            // it started on; it must not turn into a stroke halfway through.
+            penIsDown = s.tip
+            if pressed { pressControl(at: screenPoint) }
+            return
+        }
+        canvas.ignoresMouse = true
         let viewPoint = canvas.convert(window.convertPoint(fromScreen: screenPoint), from: nil)
         let width = canvas.width(forPressure: CGFloat(s.pressure))
         switch (s.tip, penIsDown) {
         case (true, false):
-            canvas.beginStroke(at: viewPoint, width: width, eraser: s.eraser)
+            // Down either way, so a press that lands elsewhere stays elsewhere
+            // even if it is dragged onto the board.
             penIsDown = true
+            // Only a stroke that starts where the board is the frontmost window
+            // — not on another app's window lying over it, or on another Space.
+            guard NSWindow.windowNumber(at: screenPoint, belowWindowWithWindowNumber: 0)
+                    == window.windowNumber else {
+                pressControl(at: screenPoint)
+                return
+            }
+            if isOnPaper(viewPoint, in: window) {
+                canvas.beginStroke(at: viewPoint, width: width, eraser: s.eraser)
+            } else {
+                pressControl(at: screenPoint)
+            }
         case (true, true):
             canvas.extendStroke(to: viewPoint, width: width)
         case (false, true):
@@ -1848,17 +2347,115 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    // MARK: - Menu bar access
-
-    var isPointerEnabled: Bool { pointer.isEnabled }
-
-    func setPointerEnabled(_ on: Bool) {
-        pointerBox.state = on ? .on : .off
-        pointerToggled(pointerBox)
+    /// The sheet takes ink everywhere except under the canvas's own control
+    /// (the + button), which sits over its corner. Anything else lying over the
+    /// paper (the page-turn animation) is not a control and does not stop ink.
+    private func isOnPaper(_ viewPoint: CGPoint, in window: NSWindow) -> Bool {
+        guard canvas.paperRect.contains(viewPoint) else { return false }
+        guard let content = window.contentView else { return true }
+        let inWindow = canvas.convert(viewPoint, to: nil)
+        let hit = content.hitTest(content.superview?.convert(inWindow, from: nil) ?? inWindow)
+        if let hit, hit !== canvas, hit.isDescendant(of: canvas) { return false }
+        return true
     }
 
-    func releasePointer() {
-        pointer.surrender()
+    /// A tap that is not ink goes to the control under the nib as an ordinary
+    /// click — posted to our own window, so the system cursor never moves and
+    /// nothing outside this app ever receives it.
+    ///
+    /// Posted to the queue, not handed to `sendEvent`: a button runs its own
+    /// tracking loop on mouse-down and waits there for the drag and the
+    /// mouse-up, which it only ever takes from the queue. The HID keeps
+    /// reporting inside that loop (common modes), so they get there.
+    private func pressControl(at screenPoint: CGPoint) {
+        // Unseized, macOS turns this same press into a real click already;
+        // another one here would press every button twice.
+        guard hid.isSeizing else { return }
+        let number = NSWindow.windowNumber(at: screenPoint, belowWindowWithWindowNumber: 0)
+        // Someone else's window on the pen display is not ours to click.
+        guard let target = NSApp.window(withWindowNumber: number), target.isVisible else { return }
+        // Only what is in front takes a click: the modal itself, or the sheet
+        // rather than the board it hangs from.
+        if let modal = NSApp.modalWindow, target !== modal { return }
+        if target.attachedSheet != nil { return }
+        // A real click activates the app on its way in; a posted one does not,
+        // and an inactive window spends its first click becoming key.
+        if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+        if target.canBecomeKey, !target.isKeyWindow { target.makeKey() }
+        controlPressNumber += 1
+        controlPress = (target, screenPoint)
+        postMouse(.leftMouseDown, at: screenPoint, to: target)
+    }
+
+    private func postMouse(_ type: NSEvent.EventType, at screenPoint: CGPoint, to target: NSWindow) {
+        let pressed = type != .leftMouseUp && type != .rightMouseUp && type != .otherMouseUp
+        guard let event = NSEvent.mouseEvent(
+            with: type, location: target.convertPoint(fromScreen: screenPoint),
+            modifierFlags: NSEvent.modifierFlags, timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: target.windowNumber, context: nil, eventNumber: controlPressNumber,
+            clickCount: 1, pressure: pressed ? 1 : 0) else { return }
+        NSApp.postEvent(event, atStart: false)
+    }
+
+    /// Every posted mouse-down gets its mouse-up, even when the pen never
+    /// lifts properly: the feed stops, the display goes, the tablet is pulled.
+    /// A button left tracking would hold the app in its loop.
+    private func releaseControlPress() {
+        guard let press = controlPress else { return }
+        controlPress = nil
+        postMouse(.leftMouseUp, at: press.at, to: press.window)
+    }
+
+    /// The pen's other buttons, assigned to a right or middle click. With the
+    /// device seized they click the board where the pen is, like the tip does;
+    /// the system cursor is elsewhere and not the pen's. Unseized, the cursor
+    /// is the pen's, and the click goes where it is, as it always did.
+    private func penClick(_ button: CGMouseButton) {
+        guard hid.isSeizing else { inputs.click(button); return }
+        guard let point = lastPenPoint else { return }
+        let number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
+        guard let target = NSApp.window(withWindowNumber: number), target.isVisible,
+              NSApp.modalWindow == nil || NSApp.modalWindow === target,
+              target.attachedSheet == nil else { return }
+        let types: [NSEvent.EventType] = button == .right ? [.rightMouseDown, .rightMouseUp]
+                                                          : [.otherMouseDown, .otherMouseUp]
+        controlPressNumber += 1
+        for type in types { postMouse(type, at: point, to: target) }
+    }
+
+    /// A key let go: exactly one key-up for a key we posted, whatever the
+    /// seize is now, and the release of a held action.
+    private func keyReleased(_ usage: UInt8, modifiers: UInt8) {
+        if postedKeys.remove(usage) != nil {
+            inputs.passThrough(usage: usage, modifiers: modifiers, down: false)
+        }
+        let action = inputs.action(for: String(format: "key.%02x", usage))
+        if action.isMomentary { run(action, down: false) }
+    }
+
+    /// The device can go away mid-press, and nothing will ever report those
+    /// keys and buttons released: a passed-through key would stay down in the
+    /// system, a held eraser would never let go, and the same key's first
+    /// press after reconnecting would be swallowed as already down.
+    private func releaseHeldInputs() {
+        for usage in pressedKeys { keyReleased(usage, modifiers: 0) }
+        pressedKeys = []
+        postedKeys = []
+        let held = previousPenButtons
+        previousPenButtons = (false, false, false)
+        if held.0 { penButton(1, "pen.button1", down: false) }
+        if held.1 { penButton(2, "pen.button2", down: false) }
+        if held.2 { penButton(3, "pen.button3", down: false) }
+        if previousStripButton {
+            previousStripButton = false
+            run(inputs.action(for: "slider.button"), down: false)
+        }
+    }
+
+    // MARK: - Menu bar access
+
+    func releaseTablet() {
+        releaseControlPress()
         hid.setSeizing(false)
     }
 }

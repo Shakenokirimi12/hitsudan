@@ -28,43 +28,61 @@ enum Lucide {
     static let pen = ["M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"]
     static let chevronLeft = ["m15 18-6-6 6-6"]
     static let chevronRight = ["m9 18 6-6-6-6"]
+    // すべて消去用。ペン/消しゴムの切替と同じ消しゴムの絵だと見分けが
+    // つかないので、「掃除する」絵を別に当てる。
+    static let brushCleaning = ["m16 22-1-4",
+                                "M19 14a1 1 0 0 0 1-1v-1a2 2 0 0 0-2-2h-3a1 1 0 0 1-1-1V4a2 2 0 0 0-4 0v5a1 1 0 0 1-1 1H6a2 2 0 0 0-2 2v1a1 1 0 0 0 1 1",
+                                "M19 14H5l-1.973 6.767A1 1 0 0 0 4 22h16a1 1 0 0 0 .973-1.233z",
+                                "m8 22 1-4"]
 
-    private static var cache: [String: NSImage] = [:]
+    private static var cache: [String: LucideIcon] = [:]
 
+    /// The glyph is rendered once as an alpha mask (a template image) and
+    /// `color` rides along unresolved, to be applied when the icon is drawn.
+    /// Baking the colour into the SVG froze dynamic colours such as
+    /// `.labelColor` at whatever appearance was current at creation, so a
+    /// light/dark switch left dark-on-dark icons behind.
     static func image(_ paths: [String], size: CGFloat, color: NSColor,
                       strokeWidth: CGFloat = 2, circle: Bool = false) -> NSImage? {
-        let hex = color.usingColorSpace(.sRGB).map {
-            String(format: "#%02X%02X%02X", Int($0.redComponent * 255),
-                   Int($0.greenComponent * 255), Int($0.blueComponent * 255))
-        } ?? "#000000"
-        let key = "\(paths.joined())|\(size)|\(hex)|\(strokeWidth)|\(circle)"
+        // A catalog colour describes itself by name ("labelColor"), not by its
+        // current RGB, so the key never pins a resolved shade.
+        let key = "\(paths.joined())|\(size)|\(color.description)|\(strokeWidth)|\(circle)"
         if let hit = cache[key] { return hit }
 
         let body = (circle ? "<circle cx=\"12\" cy=\"12\" r=\"10\"/>" : "")
             + paths.map { "<path d=\"\($0)\"/>" }.joined()
         let svg = """
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="\(Int(size))" height="\(Int(size))" \
-        fill="none" stroke="\(hex)" stroke-width="\(strokeWidth)" stroke-linecap="round" stroke-linejoin="round">\
+        fill="none" stroke="#000000" stroke-width="\(strokeWidth)" stroke-linecap="round" stroke-linejoin="round">\
         \(body)</svg>
         """
         guard let data = svg.data(using: .utf8) else { return nil }
-        var image = NSImage(data: data)
+        var image = LucideIcon(data: data)
         if image == nil {
             // Some builds only decode SVG from a URL.
             let tmp = FileManager.default.temporaryDirectory
                 .appendingPathComponent("lucide-\(abs(key.hashValue)).svg")
             try? data.write(to: tmp)
-            image = NSImage(contentsOf: tmp)
+            image = LucideIcon(contentsOf: tmp)
         }
-        if let image { cache[key] = image }
+        guard let image else { return nil }
+        image.isTemplate = true
+        image.tint = color
+        cache[key] = image
         return image
     }
 }
 
+/// A Lucide glyph as a template mask, plus the colour it is meant to be drawn
+/// in. AppKit controls tint templates themselves; custom drawing (BigButton)
+/// reads `tint` and resolves it against the appearance in effect at draw time.
+/// `tint` is set once, on the main thread, before the icon leaves `image`.
+final class LucideIcon: NSImage {
+    nonisolated(unsafe) var tint: NSColor = .labelColor
+}
+
 /// A card in the side column. Subclasses fill in `refresh`.
 class WidgetView: NSView {
-    static let allIDs = ["clock", "sessions", "board", "input"]
-
     let id: String
     private let titleLabel = NSTextField(labelWithString: "")
     let bodyLabel = NSTextField(labelWithString: "")
@@ -77,6 +95,8 @@ class WidgetView: NSView {
         let iconView = NSImageView()
         iconView.image = Lucide.image(icon, size: 15, color: .secondaryLabelColor,
                                       strokeWidth: 2, circle: iconCircle)
+        // The image is a template, so the tint is resolved per appearance.
+        iconView.contentTintColor = .secondaryLabelColor
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.widthAnchor.constraint(equalToConstant: 15).isActive = true
 
@@ -161,21 +181,42 @@ final class ClockWidget: WidgetView {
 final class SessionsWidget: WidgetView {
     private var claudePath: String?
     private var resolving = false
+    private var fetching = false
+    private var fetchGeneration = 0
     private var lastFetch = Date.distantPast
+    /// Resolving goes through a login shell, which is far heavier than the
+    /// fetch itself. When it comes back empty, `claude` is simply not
+    /// installed, so ask again only rarely rather than on every tick.
+    private var lookupFailedAt: Date?
+    private let lookupRetryInterval: TimeInterval = 300
+    /// When /bin/zsh itself last failed to start. Retried far sooner than a
+    /// missing claude, but not on every tick, and logged once per run of failures.
+    private var shellFailedAt: Date?
 
     init() {
         super.init(id: "sessions", title: "Claude セッション", icon: Lucide.terminal)
         bodyLabel.font = NSFont.systemFont(ofSize: 13)
         bodyLabel.stringValue = "読み込み中…"
-        refresh()
+        // No fetch here: the board starts hidden, and the first refresh comes
+        // when it is actually on screen.
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override func refresh() {
-        guard Date().timeIntervalSince(lastFetch) > 5 else { return }
+        // A slow `claude agents` must not have another one stacked on it.
+        guard !fetching, Date().timeIntervalSince(lastFetch) > 5 else { return }
         lastFetch = Date()
-        guard let claude = claudePath else { resolveClaude(); return }
+        guard let claude = claudePath else {
+            if let failed = lookupFailedAt,
+               Date().timeIntervalSince(failed) < lookupRetryInterval { return }
+            if let failed = shellFailedAt, Date().timeIntervalSince(failed) < 30 { return }
+            resolveClaude()
+            return
+        }
 
+        fetchGeneration += 1
+        let generation = fetchGeneration
+        fetching = true
         DispatchQueue.global().async { [weak self] in
             let task = Process()
             task.executableURL = URL(fileURLWithPath: claude)
@@ -183,11 +224,42 @@ final class SessionsWidget: WidgetView {
             let pipe = Pipe()
             task.standardOutput = pipe
             task.standardError = FileHandle.nullDevice
-            guard (try? task.run()) != nil else { return }
+            guard (try? task.run()) != nil else {
+                // The binary has moved or gone; look it up again.
+                DispatchQueue.main.async {
+                    self?.claudePath = nil
+                    self?.finishFetch(generation, rows: nil)
+                }
+                return
+            }
+            // A `claude agents` that never returns would hold `fetching` and
+            // freeze the list on whatever it last showed. terminate() alone may
+            // not unblock the read below (a child can keep the pipe open), so
+            // release the widget from here as well.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 20) {
+                if task.isRunning { task.terminate() }
+                DispatchQueue.main.async { self?.finishFetch(generation, rows: nil) }
+            }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             task.waitUntilExit()
-            let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
-            DispatchQueue.main.async { self?.render(rows) }
+            let rows = task.terminationStatus == 0
+                ? (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+                : nil
+            DispatchQueue.main.async { self?.finishFetch(generation, rows: rows) }
+        }
+    }
+
+    /// Only the fetch still in flight may settle it; a late answer from one
+    /// that already timed out is dropped. `nil` means the fetch failed, which
+    /// must not read as "no sessions".
+    private func finishFetch(_ generation: Int, rows: [[String: Any]]?) {
+        guard fetching, generation == fetchGeneration else { return }
+        fetching = false
+        if let rows {
+            render(rows)
+        } else {
+            bodyLabel.stringValue = "セッション一覧を取得できません"
+            bodyLabel.textColor = .secondaryLabelColor
         }
     }
 
@@ -229,59 +301,41 @@ final class SessionsWidget: WidgetView {
             let pipe = Pipe()
             shell.standardOutput = pipe
             shell.standardError = FileHandle.nullDevice
-            try? shell.run()
+            // If the shell never started, nothing will ever close the pipe's
+            // write end and the read below would block for good. A shell that
+            // cannot start says nothing about whether claude is installed, so it
+            // is not recorded as a failed lookup; the next refresh tries again.
+            do { try shell.run() } catch {
+                DispatchQueue.main.async {
+                    if self?.shellFailedAt == nil {
+                        NSLog("hitsudan: could not launch /bin/zsh to find claude: \(error)")
+                    }
+                    self?.shellFailedAt = Date()
+                    self?.resolving = false
+                    self?.bodyLabel.stringValue = "シェルを起動できません"
+                    self?.bodyLabel.textColor = .secondaryLabelColor
+                }
+                return
+            }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             shell.waitUntilExit()
             let found = String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             DispatchQueue.main.async {
                 self?.resolving = false
+                self?.shellFailedAt = nil
                 if found.isEmpty {
+                    self?.lookupFailedAt = Date()
                     self?.bodyLabel.stringValue = "claude が見つかりません"
+                    self?.bodyLabel.textColor = .secondaryLabelColor
                 } else {
+                    self?.lookupFailedAt = nil
                     self?.claudePath = found
                     self?.lastFetch = .distantPast
                     self?.refresh()
                 }
             }
         }
-    }
-}
-
-/// Whatever the board itself wants to say about its state.
-final class BoardWidget: WidgetView {
-    var provider: (() -> NSAttributedString)?
-
-    init() {
-        super.init(id: "board", title: "ボード", icon: Lucide.send)
-        bodyLabel.font = NSFont.systemFont(ofSize: 13)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func refresh() {
-        if let text = provider?() { bodyLabel.attributedStringValue = text }
-    }
-}
-
-
-/// What the tablet's own controls are sending. Doubles as the way to discover
-/// which key a button is wired to: press it and read it here.
-final class InputWidget: WidgetView {
-    private var lines: [String] = []
-
-    init() {
-        super.init(id: "input", title: "入力", icon: Lucide.terminal)
-        bodyLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        bodyLabel.stringValue = "本体キーやスライダーを触ると出ます"
-        bodyLabel.textColor = .secondaryLabelColor
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    func record(_ line: String) {
-        lines.insert(line, at: 0)
-        if lines.count > 4 { lines.removeLast() }
-        bodyLabel.textColor = .labelColor
-        bodyLabel.stringValue = lines.joined(separator: "\n")
     }
 }
 
