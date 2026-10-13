@@ -69,11 +69,13 @@ enum Updater {
                 return
             }
             if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                // 非公開リポジトリだと匿名アクセスは 404 になる（403 ではない）。
-                // トークンを焼き込むわけにいかないので、自動更新はリポジトリか
-                // Release が公開されていることが前提。
+                // 404 は2通りある。非公開リポジトリへの匿名アクセス（403 ではなく 404）と、
+                // prerelease しか無い場合（/releases/latest は prerelease を返さず、CI は
+                // 署名・公証の済んでいないビルドを prerelease として出す）。応答からは
+                // 区別できないので両方を挙げる。トークンを焼き込むわけにいかないので、
+                // 自動更新はリポジトリか Release が公開されていることが前提。
                 let detail = http.statusCode == 404
-                    ? "リリースが見つかりません。リポジトリが非公開のままだと、この確認は必ず失敗します。"
+                    ? "更新できるリリースが見つかりません。リポジトリが非公開か、署名・公証済みの正式リリースがまだありません（prerelease は対象外です）。"
                     : "HTTP \(http.statusCode) が返りました。"
                 completion(.failure(Failure.network(detail)))
                 return
@@ -176,10 +178,19 @@ enum Updater {
             throw Failure.malformed("展開に失敗しました。\(extraction.output)")
         }
 
-        let apps = (try? fm.contentsOfDirectory(at: unpacked, includingPropertiesForKeys: nil))?
+        let kindKeys: Set<URLResourceKey> = [.isSymbolicLinkKey, .isDirectoryKey]
+        let apps = (try? fm.contentsOfDirectory(at: unpacked, includingPropertiesForKeys: Array(kindKeys)))?
             .filter { $0.pathExtension == "app" } ?? []
         guard apps.count == 1, let fresh = apps.first else {
             throw Failure.malformed("展開した中に .app がちょうど 1 つありません（\(apps.count) 個）。")
+        }
+        // codesign, spctl and Bundle all follow a symlink and verify whatever it
+        // points to, but moveItem / replaceItemAt move the link itself. A zip
+        // holding a link to some legitimate app would pass verification and leave
+        // a dangling link in /Applications. Only a real directory is acceptable.
+        let kind = try? fresh.resourceValues(forKeys: kindKeys)
+        guard kind?.isSymbolicLink == false, kind?.isDirectory == true else {
+            throw Failure.rejected("配布物の .app が実体のフォルダではありません（シンボリックリンクなど）。")
         }
 
         try verify(fresh, against: running, expecting: release)
@@ -215,6 +226,28 @@ enum Updater {
             throw Failure.rejected("配布物の Team ID（\(theirs)）が、いまのアプリ（\(mine)）と一致しません。")
         }
 
+        // 3b. The comparison above only reads codesign's display text, and the
+        //     spctl check in 2 accepts anything on a Mac with Gatekeeper turned off
+        //     (spctl --master-disable). Re-verify against a code requirement that
+        //     pins the chain to Apple's Developer ID CA, our Team ID and our own
+        //     signing identifier. Both values are spliced into the requirement
+        //     text, so refuse rather than build it if they look unexpected.
+        guard mine.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil,
+              let myIdentifier = signingField("Identifier", of: running),
+              myIdentifier.range(of: "^[A-Za-z0-9.-]+$", options: .regularExpression) != nil else {
+            throw Failure.rejected("いま動いているアプリの署名情報を読めません。")
+        }
+        let requirement = "anchor apple generic"
+            + " and certificate 1[field.1.2.840.113635.100.6.2.6]"     // Developer ID CA
+            + " and certificate leaf[field.1.2.840.113635.100.6.1.13]" // Developer ID Application
+            + " and certificate leaf[subject.OU] = \"\(mine)\""
+            + " and identifier \"\(myIdentifier)\""
+        let pinned = try run("/usr/bin/codesign",
+                             ["--verify", "--deep", "--strict", "-R=\(requirement)", candidate.path])
+        guard pinned.status == 0 else {
+            throw Failure.rejected("配布物の署名が、いまのアプリと同じ開発者・同じアプリのものではありません。\(pinned.output)")
+        }
+
         // ここから先は、署名としては正しいものが「本当に期待した中身か」を見る。
         // 署名が通ることと、望んだアプリの望んだバージョンであることは別。
         guard let info = Bundle(url: candidate)?.infoDictionary else {
@@ -247,9 +280,15 @@ enum Updater {
     }
 
     private static func teamIdentifier(of bundle: URL) -> String? {
+        signingField("TeamIdentifier", of: bundle)
+    }
+
+    /// Reads a `Key=value` line from `codesign -dvv`; `not set` counts as absent.
+    private static func signingField(_ key: String, of bundle: URL) -> String? {
         guard let result = try? run("/usr/bin/codesign", ["-dvv", bundle.path]) else { return nil }
-        for line in result.output.split(separator: "\n") where line.hasPrefix("TeamIdentifier=") {
-            let value = String(line.dropFirst("TeamIdentifier=".count))
+        let prefix = key + "="
+        for line in result.output.split(separator: "\n") where line.hasPrefix(prefix) {
+            let value = String(line.dropFirst(prefix.count))
                 .trimmingCharacters(in: .whitespaces)
             return value == "not set" || value.isEmpty ? nil : value
         }
@@ -274,29 +313,46 @@ enum Updater {
     }
 
     /// 起動中の自分を終わらせて、差し替わったほうを開き直す。
+    ///
+    /// Launching the new instance first makes it try to seize the tablet while
+    /// the old one still holds it; that fails and it stays in non-exclusive mode
+    /// for good. Instead, leave behind a small shell that waits for this process
+    /// to exit before opening the app, then terminate. The path is passed as an
+    /// argument, not spliced into the script, so quotes or `$(...)` in it can
+    /// never be interpreted as shell code.
     static func relaunch() {
         let target = Bundle.main.bundleURL
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: target, configuration: configuration) { _, error in
-            DispatchQueue.main.async {
-                if let error {
-                    // 新しいほうが起動しなかったのに古いほうを終わらせると、
-                    // 書きかけのボードごと道連れになる。開き直せなかったこと
-                    // だけ伝えて、いま動いているプロセスは残す。
-                    let sheet = NSAlert()
-                    sheet.messageText = "更新は済みましたが、開き直せませんでした"
-                    sheet.informativeText = "このまま使い続けられます。あとで手動で終了して起動し直してください。\n\n"
-                        + error.localizedDescription
-                    sheet.alertStyle = .warning
-                    sheet.addButton(withTitle: "OK")
-                    NSApp.activate(ignoringOtherApps: true)
-                    sheet.runModal()
-                    return
-                }
-                NSApp.terminate(nil)
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = [
+            "-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$2\"",
+            "hitsudan-relaunch", String(ProcessInfo.processInfo.processIdentifier), target.path,
+        ]
+        helper.standardInput = FileHandle.nullDevice
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+        do {
+            // Once this process is gone nobody can report a failed open, so at
+            // least make sure there is something to open before quitting.
+            guard let executable = Bundle.main.executablePath,
+                  FileManager.default.isExecutableFile(atPath: executable) else {
+                throw CocoaError(.fileNoSuchFile)
             }
+            try helper.run()
+        } catch {
+            // Quitting without a way to come back would take the half-written
+            // board down with it. Report the failure and keep this process alive.
+            let sheet = NSAlert()
+            sheet.messageText = "更新は済みましたが、開き直せませんでした"
+            sheet.informativeText = "このまま使い続けられます。あとで手動で終了して起動し直してください。\n\n"
+                + error.localizedDescription
+            sheet.alertStyle = .warning
+            sheet.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            sheet.runModal()
+            return
         }
+        NSApp.terminate(nil)
     }
 
     private static func run(_ tool: String, _ arguments: [String]) throws -> (status: Int32, output: String) {
